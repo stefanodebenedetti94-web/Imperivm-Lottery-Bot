@@ -363,6 +363,74 @@ async def testcycle(ctx: commands.Context):
 
 # ---------- Run ----------
 if __name__ == "__main__":
+    bot.run(TOKEN)_jobs()
+        scheduler.start()
+
+# ---------- Comandi ----------
+@bot.command(name="whoami")
+async def whoami(ctx: commands.Context):
+    adm = "si" if is_admin(ctx) else "no"
+    await ctx.reply(f"ID: {ctx.author.id} — sei admin: {adm}", mention_author=False)
+
+@bot.command(name="mostralivelli")
+async def mostralivelli(ctx: commands.Context):
+    wins = STATE.get("wins", {})
+    if not wins:
+        await ctx.reply("Nessun livello registrato al momento. 🧾", mention_author=False)
+        return
+    lines = []
+    for uid, w in wins.items():
+        member = ctx.guild.get_member(int(uid))
+        tag = member.mention if member else f"<@{uid}>"
+        lines.append(f"{tag}: vittorie={w}, livello={level_from_wins(w)}")
+    embed = golden_embed("LIVELLI E VITTORIE", "\n".join(lines))
+    await ctx.reply(embed=embed, mention_author=False)
+
+@bot.command(name="resetlivelli")
+async def resetlivelli(ctx: commands.Context):
+    if not is_admin(ctx):
+        return
+    STATE["wins"] = {}
+    save_state(STATE)
+    await ctx.reply("Tutti i livelli sono stati azzerati (wins = 0 per tutti). 🔄", mention_author=False)
+
+@bot.command(name="resetlotteria")
+async def resetlotteria(ctx: commands.Context):
+    if not is_admin(ctx):
+        return
+    STATE["edition"] = 1
+    STATE["open_message_id"] = None
+    STATE["participants"] = []
+    save_state(STATE)
+    await ctx.reply("Lotteria resettata: edizione=1, partecipanti azzerati. ♻️", mention_author=False)
+
+@bot.command(name="testcycle")
+async def testcycle(ctx: commands.Context):
+    """Apertura -> 5s -> Chiusura -> 5s -> Annuncio (con embed)."""
+    if not is_admin(ctx):
+        return
+    guild = ctx.guild
+    channel = await find_lottery_channel(guild)
+    if not channel:
+        await ctx.reply("Canale lotteria non trovato.", mention_author=False)
+        return
+
+    await ctx.reply("Avvio ciclo di test: apertura → chiusura → vincitore. 🧪", mention_author=False)
+
+    # Apertura
+    await post_open_message(channel)
+    await asyncio.sleep(5)
+
+    # Chiusura e pick
+    winner = await close_and_pick(guild, announce_now=False)
+    await asyncio.sleep(5)
+
+    # Annuncio
+    await post_winner_announcement(channel, winner)
+    await ctx.reply("Test completo terminato. ✅", mention_author=False)
+
+# ---------- Run ----------
+if __name__ == "__main__":
     bot.run(TOKEN)ler.add_job(
         job_chiusura,
         CronTrigger(day_of_week="thu", hour=0, minute=0, timezone=TZ),
