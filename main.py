@@ -607,26 +607,23 @@ async def testcycle(ctx: commands.Context):
     await ctx.send("✅ Test completo terminato.")
 
 # ---- Eventi ----
-
 @bot.event
 async def on_ready():
     scheduler.start()
-    # stato bot
     try:
-        await bot.change_presence(activity=discord.Game(name="Lotteria IMPERIVM"))
-    except:
+        await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
+    except Exception:
         pass
-    # log su console
-    print(f"✅ {bot.user} online. Edizione corrente: {state['edition']}")
+    print(f"✅ {bot.user} online. Edizione corrente: {lottery_data['edizione']}")
 
 # ---- Avvio ----
-
 if __name__ == "__main__":
-    # Avvia il web server (Render)
+    # Avvia il web server per Render
     start_web_server()
 
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("❌ DISCORD_TOKEN mancante nelle Environment Variables.")
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if not TOKEN:
+        raise RuntimeError("❌ DISCORD_TOKEN mancante")
 
-    bot.run(token)
+    # ⛔ IMPORTANTISSIMO: niente altro dopo questa riga
+    bot.run(TOKEN)
