@@ -400,7 +400,7 @@ async def mostralivelli(ctx: commands.Context):
 async def resetlivelli(ctx: commands.Context):
     state["wins"] = {}
     save_state(state)
-    await ctx.reply("🔄 **Tutti i livelli sono stati azzerati** *(wins = 0 per tutti)*.", mention_author=False)
+    await ctx.reply("Tutti i livelli sono stati azzerati (wins = 0 per tutti).", mention_author=False)
 
 @bot.command()
 @admin_only()
