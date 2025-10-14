@@ -160,6 +160,7 @@ async def post_open_message(channel: discord.TextChannel):
     return msg
 
 async def post_close_message(channel: discord.TextChannel, no_participants: bool):
+    # <<< UNICA MODIFICA: aggiunto orario preciso dell’annuncio (08:00 di giovedì) >>>
     if no_participants:
         desc = (
             "La sorte ha parlato… 😕  **Nessun partecipante valido** questa settimana.\n"
@@ -167,8 +168,9 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
         )
     else:
         desc = (
-            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all'alba.\n"
-            "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei."
+            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all’alba.\n"
+            "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei.\n\n"
+            "**L’annuncio ufficiale del vincitore avverrà alle ore 08:00 di giovedì.**"
         )
     await channel.send(embed=golden_embed("LOTTERIA IMPERIVM – CHIUSA", desc))
 
