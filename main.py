@@ -1,36 +1,41 @@
-# === IMPERIVM Lottery Bot — main.py (Render ready) ===
-# discord.py 2.x • APScheduler • Europe/Rome • Flask keepalive (Render)
+# === IMPERIVM Lottery Bot – main.py (Render / discord.py 2.x) ===
 
 import os
 import json
 import asyncio
 import random
 from datetime import datetime
-from typing import Optional
-import pytz
+from threading import Thread
 
+import pytz
 import discord
 from discord.ext import commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# ---- Keepalive HTTP (Render) -------------------------------------------------
+# --- Mini web server per Render (healthcheck) ---
 from flask import Flask
-from threading import Thread
-from waitress import serve
+try:
+    from waitress import serve
+    USE_WAITRESS = True
+except Exception:
+    USE_WAITRESS = False
 
 app = Flask(__name__)
 
 @app.get("/")
 def index():
-    return "IMPERIVM Lottery Bot è vivo · Render"
+    return "IMPERIVM Lottery Bot è vivo 📜"
 
-def start_http_server():
+def start_web_server():
     port = int(os.getenv("PORT", "8080"))
-    t = Thread(target=serve, args=(app,), kwargs={"host": "0.0.0.0", "port": port}, daemon=True)
-    t.start()
+    if USE_WAITRESS:
+        Thread(target=lambda: serve(app, host="0.0.0.0", port=port), daemon=True).start()
+    else:
+        Thread(target=lambda: app.run(host="0.0.0.0", port=port), daemon=True).start()
 
-# ---- Config ------------------------------------------------------------------
+
+# ---------- Config ----------
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.guilds = True
@@ -39,13 +44,13 @@ INTENTS.reactions = True
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Manca DISCORD_TOKEN nelle Environment Variables di Render.")
+    raise RuntimeError("❌ Manca DISCORD_TOKEN nelle Environment Variables di Render.")
 
-# Se non imposti l'ID, cerchiamo per nome canale
+# Canale lotteria: puoi lasciare 0 per cercarlo per nome
 LOTTERY_CHANNEL_ID = int(os.getenv("LOTTERY_CHANNEL_ID", "0"))
 LOTTERY_CHANNEL_NAME_CANDIDATES = ["lotteria-imperiale", "lotteria-imperivm"]
 
-# Opzionale: lista di admin extra (oltre ai permessi Discord)
+# Admin extra (facoltativo). Se vuoto valgono i permessi admin Discord.
 ADMIN_IDS = set()
 _env_admins = os.getenv("ADMINS", "").strip()
 if _env_admins:
@@ -62,8 +67,8 @@ DEFAULT_STATE = {
     "edition": 1,
     "open_message_id": None,
     "participants": [],
-    "wins": {},            # {user_id(str): 1..3}
-    "last_winner_id": None # salvato alla chiusura; annunciato alle 08:00
+    "wins": {},             # {user_id(str): vittorie (1..3, reset a 1 dopo 3)}
+    "last_winner_id": None  # salvato alla chiusura; annunciato alle 08:00
 }
 
 def load_state():
@@ -88,15 +93,16 @@ STATE = load_state()
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 scheduler = AsyncIOScheduler(timezone=TZ)
 
-# ---- Utility -----------------------------------------------------------------
-def is_admin(ctx_or_member) -> bool:
+
+# ---------- Utility ----------
+def is_admin(ctx_or_member):
     m = ctx_or_member.author if hasattr(ctx_or_member, "author") else ctx_or_member
-    if ADMIN_IDS and getattr(m, "id", None) in ADMIN_IDS:
+    if ADMIN_IDS and m.id in ADMIN_IDS:
         return True
     perms = getattr(m, "guild_permissions", None)
     return bool(perms and perms.administrator)
 
-async def find_lottery_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+async def find_lottery_channel(guild: discord.Guild):
     if LOTTERY_CHANNEL_ID:
         ch = guild.get_channel(LOTTERY_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel):
@@ -106,6 +112,7 @@ async def find_lottery_channel(guild: discord.Guild) -> Optional[discord.TextCha
         for ch in guild.text_channels:
             if ch.name.lower() == name:
                 return ch
+    # ultima spiaggia: primo canale testuale disponibile
     return guild.text_channels[0] if guild.text_channels else None
 
 def level_from_wins(wins: int) -> int:
@@ -119,7 +126,8 @@ def golden_embed(title: str, desc: str) -> discord.Embed:
     e.set_footer(text="IMPERIVM • Lotteria settimanale")
     return e
 
-# ---- Flusso lotteria ---------------------------------------------------------
+
+# ---------- Flusso lotteria ----------
 async def post_open_message(channel: discord.TextChannel):
     global STATE
     edition = STATE["edition"]
@@ -127,17 +135,17 @@ async def post_open_message(channel: discord.TextChannel):
     lines = [
         "Cittadini dell'Impero 👑",
         "È giunto il momento di sfidare la sorte sotto lo stendardo dorato dell'IMPERIVM!",
-        "Da ora fino alle 00:00 di giovedì, la lotteria imperiale è ufficialmente aperta! 🧾",
+        "Da ora fino alle 00:00 di giovedì, la lotteria imperiale è ufficialmente **aperta**! 🧾",
         "",
         "Reagite con ✅ a questo messaggio per partecipare all'estrazione.",
         "Il destino premierà solo i più audaci!",
         "",
-        "⚔ Premi in palio:",
+        "⚔️ Premi in palio:",
         "  1️⃣ 1ª vittoria → 100.000 Kama",
-        "  2️⃣ 2ª vittoria → Scudo di Gilda (se già posseduto → 250.000 Kama)",
-        "  3️⃣ 3ª vittoria → 500.000 Kama (reset dei livelli)",
+        "  2️⃣ 2ª vittoria → Scudo di Gilda *(se già posseduto → 250.000 Kama)*",
+        "  3️⃣ 3ª vittoria → 500.000 Kama *(reset dei livelli)*",
         "",
-        f"Edizione n°{edition}",
+        f"**Edizione n°{edition}**",
     ]
     embed = golden_embed("LOTTERIA IMPERIVM – EDIZIONE SETTIMANALE", "\n".join(lines))
     msg = await channel.send(embed=embed)
@@ -153,14 +161,18 @@ async def post_open_message(channel: discord.TextChannel):
 
 async def post_close_message(channel: discord.TextChannel, no_participants: bool):
     if no_participants:
-        desc = ("La sorte ha parlato… 😕  Nessun partecipante valido questa settimana.\n"
-                "Torniamo mercoledì prossimo! 👑")
+        desc = (
+            "La sorte ha parlato… 😕  **Nessun partecipante valido** questa settimana.\n"
+            "Torniamo mercoledì prossimo! 👑"
+        )
     else:
-        desc = ("La sorte ha parlato… 🌅  Il verdetto sarà svelato all'alba.\n"
-                "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei.")
+        desc = (
+            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all'alba.\n"
+            "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei."
+        )
     await channel.send(embed=golden_embed("LOTTERIA IMPERIVM – CHIUSA", desc))
 
-async def post_winner_announcement(channel: discord.TextChannel, member: Optional[discord.Member]):
+async def post_winner_announcement(channel: discord.TextChannel, member: discord.Member | None):
     if member is None:
         desc = "Nessun partecipante questa settimana. Riproviamo mercoledì prossimo! 🙂"
         await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc))
@@ -169,41 +181,45 @@ async def post_winner_announcement(channel: discord.TextChannel, member: Optiona
     uid = str(member.id)
     wins = STATE["wins"].get(uid, 0)
     lvl = level_from_wins(wins)
+
     if lvl == 1:
         premio = "100.000 Kama"
     elif lvl == 2:
-        premio = "Scudo di Gilda (se già posseduto → 250.000 Kama)"
+        premio = "Scudo di Gilda *(se già posseduto → 250.000 Kama)*"
     else:
-        premio = "500.000 Kama (reset dei livelli)"
+        premio = "500.000 Kama *(reset dei livelli)*"
 
     desc = (
-        f"Vincitore: {member.mention} 🎉\n"
-        f"Livello attuale: {lvl}\n"
-        f"Ricompensa: {premio}\n"
+        f"**Vincitore:** {member.mention} 🎉\n"
+        f"**Livello attuale:** {lvl}\n"
+        f"**Ricompensa:** {premio}\n"
         "La prossima estrazione avverrà mercoledì a mezzanotte. 🕛"
     )
     await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc))
 
 async def collect_participants(msg: discord.Message) -> list[int]:
-    ids = []
+    ids: list[int] = []
     try:
         await msg.fetch()
     except Exception:
         pass
     for r in msg.reactions:
         if str(r.emoji) == "✅":
-            async for u in r.users():
+            users = [u async for u in r.users()]
+            for u in users:
                 if not u.bot:
                     ids.append(u.id)
     # dedup
     return list(dict.fromkeys(ids))
 
-async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Optional[discord.Member]:
+async def close_and_pick(guild: discord.Guild, announce_now: bool = False):
+    """Chiude la lotteria, calcola vincitore e (se announce_now=True) annuncia subito."""
     global STATE
     channel = await find_lottery_channel(guild)
     if not channel:
         return None
 
+    # carica messaggio apertura
     msg = None
     msg_id = STATE.get("open_message_id")
     if msg_id:
@@ -219,7 +235,7 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Op
     no_participants = len(participants) == 0
     await post_close_message(channel, no_participants)
 
-    winner_member: Optional[discord.Member] = None
+    winner_member = None
     STATE["last_winner_id"] = None
 
     if not no_participants:
@@ -228,10 +244,9 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Op
         uid = str(win_id)
         w = STATE["wins"].get(uid, 0) + 1
         if w > 3:
-            w = 1  # reset dopo la 3ª
+            w = 1  # reset dopo la 3ª vittoria
         STATE["wins"][uid] = w
         save_state(STATE)
-
         try:
             winner_member = await guild.fetch_member(win_id)
         except Exception:
@@ -240,6 +255,7 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Op
     if announce_now:
         await post_winner_announcement(channel, winner_member)
 
+    # chiudo edizione
     STATE["open_message_id"] = None
     save_state(STATE)
     return winner_member
@@ -250,10 +266,12 @@ async def open_lottery(guild: discord.Guild):
     if not channel:
         return
     await post_open_message(channel)
+    # prepara l'etichetta “edizione n°X” per la prossima settimana
     STATE["edition"] += 1
     save_state(STATE)
 
-# ---- Scheduling settimanale ---------------------------------------------------
+
+# ---------- Scheduling settimanale ----------
 # Prima apertura automatica: 22/10/2025 00:00 (Europe/Rome)
 START_DATE = TZ.localize(datetime(2025, 10, 22, 0, 0, 0))
 
@@ -262,8 +280,7 @@ def schedule_weekly_jobs():
        - mer 00:00  → apertura
        - gio 00:00  → chiusura + calcolo vincitore (salvato)
        - gio 08:00  → annuncio ufficiale
-       Se adesso è prima del 22/10/2025 00:00, la primissima apertura usa START_DATE.
-    """
+       Se adesso è prima del 22/10/2025 00:00, la primissima apertura usa START_DATE."""
     trig_open     = CronTrigger(day_of_week="wed", hour=0, minute=0, timezone=TZ)
     trig_close    = CronTrigger(day_of_week="thu", hour=0, minute=0, timezone=TZ)
     trig_announce = CronTrigger(day_of_week="thu", hour=8, minute=0, timezone=TZ)
@@ -281,17 +298,17 @@ def schedule_weekly_jobs():
 
     async def do_announce():
         for g in bot.guilds:
-            ch = await find_lottery_channel(g)
-            if not ch:
+            channel = await find_lottery_channel(g)
+            if not channel:
                 continue
             lw = STATE.get("last_winner_id")
-            member: Optional[discord.Member] = None
+            member = None
             if lw:
                 try:
                     member = await g.fetch_member(lw)
                 except Exception:
                     member = g.get_member(lw)
-            await post_winner_announcement(ch, member)
+            await post_winner_announcement(channel, member)
             STATE["last_winner_id"] = None
             save_state(STATE)
 
@@ -299,20 +316,21 @@ def schedule_weekly_jobs():
     scheduler.add_job(lambda: asyncio.create_task(do_close()), trig_close)
     scheduler.add_job(lambda: asyncio.create_task(do_announce()), trig_announce)
 
-# ---- Eventi ------------------------------------------------------------------
+
+# ---------- Eventi ----------
 @bot.event
 async def on_ready():
-    start_http_server()  # avvia server HTTP (Render)
-    if not scheduler.running:
-        schedule_weekly_jobs()
-        scheduler.start()
     try:
         await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
     except Exception:
         pass
-    print(f"✅ {bot.user} online. Edizione corrente: {STATE['edition']}")
+    print(f"✅ Bot online come {bot.user} — edizione corrente: {STATE['edition']}")
+    if not scheduler.running:
+        schedule_weekly_jobs()
+        scheduler.start()
 
-# ---- Comandi -----------------------------------------------------------------
+
+# ---------- Comandi ----------
 @bot.command(name="whoami")
 async def whoami(ctx: commands.Context):
     adm = "sì" if is_admin(ctx) else "no"
@@ -325,12 +343,12 @@ async def mostralivelli(ctx: commands.Context):
         await ctx.reply("📜 Nessun livello registrato al momento.", mention_author=False)
         return
     lines = []
-    # ordino per ID per stabilità
-    for uid, w in sorted(wins.items(), key=lambda kv: int(kv[0])):
+    for uid, w in wins.items():
         member = ctx.guild.get_member(int(uid))
         tag = member.mention if member else f"<@{uid}>"
-        lines.append(f"{tag}: vittorie={w}, livello={level_from_wins(w)}")
-    await ctx.reply(embed=golden_embed("REGISTRO LIVELLI", "\n".join(lines)), mention_author=False)
+        lines.append(f"{tag}: vittorie = {w}, livello = {level_from_wins(w)}")
+    embed = golden_embed("REGISTRO LIVELLI", "\n".join(lines))
+    await ctx.reply(embed=embed, mention_author=False)
 
 @bot.command(name="resetlivelli")
 async def resetlivelli(ctx: commands.Context):
@@ -348,365 +366,50 @@ async def resetlotteria(ctx: commands.Context):
     STATE["open_message_id"] = None
     STATE["participants"] = []
     save_state(STATE)
-    await ctx.reply("♻️ Lotteria resettata: edizione=1, partecipanti azzerati.", mention_author=False)
+    await ctx.reply("🧹 Lotteria resettata: edizione=1, partecipanti azzerati.", mention_author=False)
 
 @bot.command(name="testcycle")
 async def testcycle(ctx: commands.Context):
-    """Apertura -> 5s -> Chiusura -> 5s -> Annuncio (con embed)."""
+    """Simula un ciclo completo con messaggi reali (apertura → chiusura → annuncio)."""
     if not is_admin(ctx):
         return
+
     guild = ctx.guild
     channel = await find_lottery_channel(guild)
     if not channel:
-        await ctx.reply("Canale lotteria non trovato.", mention_author=False)
+        await ctx.reply("⚠️ Canale lotteria non trovato.", mention_author=False)
         return
 
-    await ctx.reply("🧪 Avvio ciclo di test: apertura → chiusura → vincitore.", mention_author=False)
-
-    # Apertura
-    await post_open_message(channel)
-    await asyncio.sleep(5)
-
-    # Chiusura e pick
-    winner = await close_and_pick(guild, announce_now=False)
-    await asyncio.sleep(5)
-
-    # Annuncio
-    await post_winner_announcement(channel, winner)
-    await ctx.reply("✅ Test completo terminato.", mention_author=False)
-
-# ---- Avvio -------------------------------------------------------------------
-if __name__ == "__main__":
-    # IMPORTANTISSIMO: nessun carattere *dopo* questa riga nella stessa linea
-    bot.run(TOKEN)
-        scheduler.start()
-
-# ---------- Comandi ----------
-@bot.command(name="whoami")
-async def whoami(ctx: commands.Context):
-    adm = "si" if is_admin(ctx) else "no"
-    await ctx.reply(f"ID: {ctx.author.id} — sei admin: {adm}", mention_author=False)
-
-@bot.command(name="mostralivelli")
-async def mostralivelli(ctx: commands.Context):
-    wins = STATE.get("wins", {})
-    if not wins:
-        await ctx.reply("Nessun livello registrato al momento. 🧾", mention_author=False)
-        return
-    lines = []
-    for uid, w in wins.items():
-        member = ctx.guild.get_member(int(uid))
-        tag = member.mention if member else f"<@{uid}>"
-        lines.append(f"{tag}: vittorie={w}, livello={level_from_wins(w)}")
-    embed = golden_embed("LIVELLI E VITTORIE", "\n".join(lines))
-    await ctx.reply(embed=embed, mention_author=False)
-
-@bot.command(name="resetlivelli")
-async def resetlivelli(ctx: commands.Context):
-    if not is_admin(ctx):
-        return
-    STATE["wins"] = {}
-    save_state(STATE)
-    await ctx.reply("Tutti i livelli sono stati azzerati (wins = 0 per tutti). 🔄", mention_author=False)
-
-@bot.command(name="resetlotteria")
-async def resetlotteria(ctx: commands.Context):
-    if not is_admin(ctx):
-        return
-    STATE["edition"] = 1
-    STATE["open_message_id"] = None
-    STATE["participants"] = []
-    save_state(STATE)
-    await ctx.reply("Lotteria resettata: edizione=1, partecipanti azzerati. ♻️", mention_author=False)
-
-@bot.command(name="testcycle")
-async def testcycle(ctx: commands.Context):
-    """Apertura -> 5s -> Chiusura -> 5s -> Annuncio (con embed)."""
-    if not is_admin(ctx):
-        return
-    guild = ctx.guild
-    channel = await find_lottery_channel(guild)
-    if not channel:
-        await ctx.reply("Canale lotteria non trovato.", mention_author=False)
-        return
-
-    await ctx.reply("Avvio ciclo di test: apertura → chiusura → vincitore. 🧪", mention_author=False)
-
-    # Apertura
-    await post_open_message(channel)
-    await asyncio.sleep(5)
-
-    # Chiusura e pick
-    winner = await close_and_pick(guild, announce_now=False)
-    await asyncio.sleep(5)
-
-    # Annuncio
-    await post_winner_announcement(channel, winner)
-    await ctx.reply("Test completo terminato. ✅", mention_author=False)
-
-# ---------- Run ----------
-if __name__ == "__main__":
-    bot.run(TOKEN)_jobs()
-        scheduler.start()
-
-# ---------- Comandi ----------
-@bot.command(name="whoami")
-async def whoami(ctx: commands.Context):
-    adm = "si" if is_admin(ctx) else "no"
-    await ctx.reply(f"ID: {ctx.author.id} — sei admin: {adm}", mention_author=False)
-
-@bot.command(name="mostralivelli")
-async def mostralivelli(ctx: commands.Context):
-    wins = STATE.get("wins", {})
-    if not wins:
-        await ctx.reply("Nessun livello registrato al momento. 🧾", mention_author=False)
-        return
-    lines = []
-    for uid, w in wins.items():
-        member = ctx.guild.get_member(int(uid))
-        tag = member.mention if member else f"<@{uid}>"
-        lines.append(f"{tag}: vittorie={w}, livello={level_from_wins(w)}")
-    embed = golden_embed("LIVELLI E VITTORIE", "\n".join(lines))
-    await ctx.reply(embed=embed, mention_author=False)
-
-@bot.command(name="resetlivelli")
-async def resetlivelli(ctx: commands.Context):
-    if not is_admin(ctx):
-        return
-    STATE["wins"] = {}
-    save_state(STATE)
-    await ctx.reply("Tutti i livelli sono stati azzerati (wins = 0 per tutti). 🔄", mention_author=False)
-
-@bot.command(name="resetlotteria")
-async def resetlotteria(ctx: commands.Context):
-    if not is_admin(ctx):
-        return
-    STATE["edition"] = 1
-    STATE["open_message_id"] = None
-    STATE["participants"] = []
-    save_state(STATE)
-    await ctx.reply("Lotteria resettata: edizione=1, partecipanti azzerati. ♻️", mention_author=False)
-
-@bot.command(name="testcycle")
-async def testcycle(ctx: commands.Context):
-    """Apertura -> 5s -> Chiusura -> 5s -> Annuncio (con embed)."""
-    if not is_admin(ctx):
-        return
-    guild = ctx.guild
-    channel = await find_lottery_channel(guild)
-    if not channel:
-        await ctx.reply("Canale lotteria non trovato.", mention_author=False)
-        return
-
-    await ctx.reply("Avvio ciclo di test: apertura → chiusura → vincitore. 🧪", mention_author=False)
-
-    # Apertura
-    await post_open_message(channel)
-    await asyncio.sleep(5)
-
-    # Chiusura e pick
-    winner = await close_and_pick(guild, announce_now=False)
-    await asyncio.sleep(5)
-
-    # Annuncio
-    await post_winner_announcement(channel, winner)
-    await ctx.reply("Test completo terminato. ✅", mention_author=False)
-
-# ---------- Run ----------
-if __name__ == "__main__":
-    bot.run(TOKEN)ler.add_job(
-        job_chiusura,
-        CronTrigger(day_of_week="thu", hour=0, minute=0, timezone=TZ),
-        args=[guild],
-        id="lotto_close",
-        next_run_time=datetime(2025, 10, 23, 0, 0, tzinfo=TZ)
-    )
-    # Annuncio: Gio 08:00
-    scheduler.add_job(
-        job_annuncio,
-        CronTrigger(day_of_week="thu", hour=8, minute=0, timezone=TZ),
-        args=[guild],
-        id="lotto_announce",
-        next_run_time=datetime(2025, 10, 23, 8, 0, tzinfo=TZ)
-    )
-    scheduler.start()
-
-# --- COMANDI ------------------------------------------------------------------
-def admin_only():
-    async def predicate(ctx: commands.Context):
-        if not is_admin(ctx.author):
-            await ctx.reply("❌ Non sei autorizzato a usare questo comando.", mention_author=False)
-            return False
-        return True
-    return commands.check(predicate)
-
-@bot.event
-async def on_ready():
-    # Prendi la prima guild dove è presente
-    guild = bot.guilds[0] if bot.guilds else None
-    if guild:
-        setup_scheduler(guild)
-        ch = await find_channel(guild)
-        if ch:
-            print(f"✅ Lotteria IMPERIVM bot online. Canale: #{ch.name}. Edizione corrente: {state.get('edizione', 1)}")
-        else:
-            print("⚠️ Nessun canale trovato (controlla CHANNEL_ID o il nome del canale).")
-    else:
-        print("⚠️ Il bot non è in nessuna guild.")
-
-@bot.command()
-async def whoami(ctx: commands.Context):
     await ctx.reply(
-        f"BOT LOTTERIA IMPERIM 📜\nID: `{ctx.author.id}` – sei admin {'✅' if is_admin(ctx.author) else '❌'}",
+        "🧪 **Avvio ciclo di test completo:**\n"
+        "📜 Apertura → (20s) → Chiusura → (20s) → Annuncio (10s dopo).",
         mention_author=False
     )
 
-@bot.command()
-@admin_only()
-async def testcycle(ctx: commands.Context):
-    """Apertura → 30s → chiusura → 10s → annuncio (sequenza pulita con embed eleganti)."""
-    guild = ctx.guild
-    ch = await find_channel(guild)
-    if not ch:
-        await ctx.reply("⚠️ Non trovo il canale della lotteria.", mention_author=False)
-        return
+    # --- Apertura ---
+    await post_open_message(channel)
+    await asyncio.sleep(20)  # tempo per reagire
 
-    note = await ctx.reply("🧪 **Avvio ciclo di test:** apertura → chiusura → vincitore.", mention_author=False)
+    # --- Chiusura e selezione vincitore (senza annuncio immediato) ---
+    await close_and_pick(guild, announce_now=False)
+    await asyncio.sleep(20)
 
-    # Apertura
-    await post_apertura(ch)
+    # --- Annuncio del vincitore ---
+    winner_id = STATE.get("last_winner_id")
+    winner = None
+    if winner_id:
+        try:
+            winner = await guild.fetch_member(winner_id)
+        except Exception:
+            winner = ctx.guild.get_member(winner_id)
 
-    # attesa 30s
-    await asyncio.sleep(30)
-
-    # Chiusura + raccolta partecipanti
-    await post_chiusura(ch)
-    await chiudi_raccogli_partecipanti(guild)
-
-    # attesa 10s
+    await post_winner_announcement(channel, winner)
     await asyncio.sleep(10)
-
-    # Annuncio
-    await estrai_e_annuncio(guild)
 
     await ctx.reply("✅ **Test completo terminato.**", mention_author=False)
 
-@bot.command()
-@admin_only()
-async def mostralivelli(ctx: commands.Context):
-    wins = state.get("wins", {})
-    if not wins:
-        await ctx.reply("📜 **Nessun livello** registrato al momento.", mention_author=False)
-        return
 
-    lines = []
-    for uid, w in sorted(wins.items(), key=lambda x: int(x[0])):
-        member = ctx.guild.get_member(int(uid))
-        name = member.mention if member else f"`{uid}`"
-        lines.append(f"• {name} → **Livello {w if w>0 else 0}**")
-    desc = "\n".join(lines)
-    emb = make_embed("REGISTRO LIVELLI", desc or "Nessun dato.", COLOR_NEUTRAL)
-    await ctx.reply(embed=emb, mention_author=False)
-
-@bot.command()
-@admin_only()
-async def resetlivelli(ctx: commands.Context):
-    state["wins"] = {}
-    save_state(state)
-    await ctx.reply("Tutti i livelli sono stati azzerati (wins = 0 per tutti).", mention_author=False)
-
-@bot.command()
-@admin_only()
-async def resetlotteria(ctx: commands.Context):
-    state["edizione"] = 1
-    state["current_message_id"] = None
-    state["partecipanti_ids"] = []
-    save_state(state)
-    await ctx.reply("🧹 **Lotteria resettata:** edizione=1, partecipanti azzerati.", mention_author=False)
-
-# --- AVVIO --------------------------------------------------------------------
+# ---------- Avvio ----------
 if __name__ == "__main__":
     start_web_server()  # server HTTP per Render
-    token = os.getenv("DISCORD_TOKEN", "")
-    if not token:
-        raise RuntimeError("❌ DISCORD_TOKEN mancante nelle Environment Variables.")
-    bot.run(token)    await ctx.reply("🔄 Tutti i **livelli** sono stati azzerati (wins = 0 per tutti).")
-
-@bot.command(name="mostralivelli")
-async def mostralivelli(ctx: commands.Context):
-    if not is_admin(ctx):
-        return
-    guild = ctx.guild
-    levels = state.get("levels", {})
-    if not levels:
-        await ctx.reply("📜 Nessun livello registrato al momento.")
-        return
-
-    # ordina per livello desc poi per nome
-    items = []
-    for uid, lvl in levels.items():
-        try:
-            uid_i = int(uid)
-        except:
-            continue
-        member = guild.get_member(uid_i)
-        name = member.display_name if member else f"utente {uid}"
-        items.append((lvl, name, uid_i))
-    items.sort(key=lambda x: (-x[0], x[1].lower()))
-
-    lines = [f"{i+1}. **{name}** ({fmt_user(guild, uid)}) → Livello **{lvl}**"
-             for i, (lvl, name, uid) in enumerate(items)]
-    text = "🏆 **Livelli attuali**\n" + "\n".join(lines)
-    await ctx.reply(text)
-
-@bot.command(name="testcycle")
-async def testcycle(ctx: commands.Context):
-    # Solo admin
-    if not is_admin(ctx):
-        return
-
-    guild = ctx.guild
-    chan = await get_lottery_channel(guild)
-    if chan is None:
-        await ctx.reply("❌ Non trovo il canale della lotteria. Imposta `CHANNEL_ID` o rinomina un canale in `#lotteria-imperivm`.")
-        return
-
-    await ctx.reply(
-        f"🧪 Avvio ciclo di test **in** {chan.mention}: **Apertura → (30s) → Chiusura → (10s) → Annuncio**.\n"
-        "Reagisci con ✅ al messaggio di apertura!"
-    )
-
-    # Apertura
-    await start_lottery(guild)
-    await asyncio.sleep(30)  # tempo per reagire
-
-    # Chiusura
-    await close_lottery(guild)
-    await asyncio.sleep(10)
-
-    # Annuncio
-    await announce_winner(guild)
-
-    await ctx.send("✅ Test completo terminato.")
-
-# ---- Eventi ----
-@bot.event
-async def on_ready():
-    scheduler.start()
-    try:
-        await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
-    except Exception:
-        pass
-    print(f"✅ {bot.user} online. Edizione corrente: {lottery_data['edizione']}")
-
-# ---- Avvio ----
-if __name__ == "__main__":
-    # Avvia il web server per Render
-    start_web_server()
-
-    TOKEN = os.getenv("DISCORD_TOKEN")
-    if not TOKEN:
-        raise RuntimeError("❌ DISCORD_TOKEN mancante")
-
-    # ⛔ IMPORTANTISSIMO: niente altro dopo questa riga
     bot.run(TOKEN)
