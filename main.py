@@ -1,4 +1,4 @@
-# === IMPERIVM Lottery Bot – main.py (Render / discord.py 2.x) ===
+# === IMPERIVM Lottery Bot – main.py (discord.py 2.x + APScheduler + Flask) ===
 
 import os
 import json
@@ -97,7 +97,7 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 # ---------- Utility ----------
 def is_admin(ctx_or_member):
     m = ctx_or_member.author if hasattr(ctx_or_member, "author") else ctx_or_member
-    if ADMIN_IDS and m.id in ADMIN_IDS:
+    if ADMIN_IDS and getattr(m, "id", None) in ADMIN_IDS:
         return True
     perms = getattr(m, "guild_permissions", None)
     return bool(perms and perms.administrator)
@@ -160,17 +160,17 @@ async def post_open_message(channel: discord.TextChannel):
     return msg
 
 async def post_close_message(channel: discord.TextChannel, no_participants: bool):
-    # Include l’orario dell’annuncio alle 08:00 di giovedì
     if no_participants:
         desc = (
             "La sorte ha parlato… 😕  **Nessun partecipante valido** questa settimana.\n"
-            "Torniamo mercoledì prossimo! 👑"
+            "Torniamo mercoledì prossimo! 👑\n\n"
+            "ℹ️ Il vincitore viene annunciato alle **08:00** di giovedì."
         )
     else:
         desc = (
-            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all’alba.\n"
+            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all'alba.\n"
             "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei.\n\n"
-            "**L’annuncio ufficiale del vincitore avverrà alle ore 08:00 di giovedì.**"
+            "ℹ️ Il vincitore verrà annunciato alle **08:00** di giovedì."
         )
     await channel.send(embed=golden_embed("LOTTERIA IMPERIVM – CHIUSA", desc))
 
@@ -319,43 +319,6 @@ def schedule_weekly_jobs():
     scheduler.add_job(lambda: asyncio.create_task(do_announce()), trig_announce)
 
 
-# ---------- Catch-up all’avvio ----------
-async def catch_up_if_needed():
-    """Recupera eventuali eventi persi se il bot si è avviato dopo gli orari previsti."""
-    now = datetime.now(TZ)
-    weekday = now.weekday()  # 0=Mon ... 2=Wed ... 3=Thu
-    open_msg_id = STATE.get("open_message_id")
-    last_winner_id = STATE.get("last_winner_id")
-
-    # MERCOLEDÌ: tra 00:00 e 23:59 → se non c'è apertura, apri subito
-    if weekday == 2:  # Wed
-        if open_msg_id is None:
-            for g in bot.guilds:
-                await open_lottery(g)
-        return
-
-    # GIOVEDÌ prima delle 08:00 → se c'è apertura, chiudi subito
-    if weekday == 3:  # Thu
-        if now.hour < 8:
-            if open_msg_id is not None:
-                for g in bot.guilds:
-                    await close_and_pick(g, announce_now=False)
-            return
-        else:
-            # GIOVEDÌ >= 08:00 → se c'è vincitore salvato, annuncia subito
-            if last_winner_id is not None:
-                for g in bot.guilds:
-                    ch = await find_lottery_channel(g)
-                    member = None
-                    try:
-                        member = await g.fetch_member(last_winner_id)
-                    except Exception:
-                        member = g.get_member(last_winner_id)
-                    await post_winner_announcement(ch, member)
-                STATE["last_winner_id"] = None
-                save_state(STATE)
-
-
 # ---------- Eventi ----------
 @bot.event
 async def on_ready():
@@ -363,23 +326,20 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
     except Exception:
         pass
-    print(f"✅ Bot online come {bot.user} — edizione corrente: {STATE['edition']}")
-
-    # Sync slash commands (una volta all'avvio)
+    # Sync degli slash (evita “l'app non ha risposto” perché non registrato)
     try:
         await bot.tree.sync()
-    except Exception:
-        pass
+        print("Slash commands sincronizzati ✅")
+    except Exception as e:
+        print(f"Slash sync error: {e}")
 
+    print(f"✅ Bot online come {bot.user} — edizione corrente: {STATE['edition']}")
     if not scheduler.running:
         schedule_weekly_jobs()
         scheduler.start()
 
-    # Catch-up (se partiamo in ritardo recuperiamo il ciclo odierno)
-    await catch_up_if_needed()
 
-
-# ---------- Comandi testo (prefix !) ----------
+# ---------- Comandi testuali ----------
 @bot.command(name="whoami")
 async def whoami(ctx: commands.Context):
     adm = "sì" if is_admin(ctx) else "no"
@@ -457,81 +417,65 @@ async def testcycle(ctx: commands.Context):
 
     await ctx.reply("✅ **Test completo terminato.**", mention_author=False)
 
-@bot.command(name="apertura")
-async def apertura_cmd(ctx: commands.Context):
-    """Apre subito la lotteria (solo admin)."""
-    if not is_admin(ctx):
+
+# ---------- Slash commands (con defer per evitare timeout) ----------
+from discord import app_commands
+
+def user_is_admin_interaction(inter: discord.Interaction) -> bool:
+    if ADMIN_IDS and inter.user.id in ADMIN_IDS:
+        return True
+    perms = getattr(inter.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+@app_commands.check(lambda inter: user_is_admin_interaction(inter))
+@bot.tree.command(name="apertura", description="Forza l'apertura della lotteria (admin).")
+async def apertura_slash(inter: discord.Interaction):
+    await inter.response.defer(thinking=True)  # evita timeout di 3s
+    guild = inter.guild
+    if guild is None:
+        await inter.followup.send("Questo comando va usato in un server.", ephemeral=True)
         return
-    await open_lottery(ctx.guild)
-    await ctx.reply("📜 Lotteria **aperta** manualmente (comando admin).", mention_author=False)
-
-
-# ---------- Slash command ----------
-# Richiede lo scope "applications.commands" e il sync in on_ready
-
-@bot.tree.command(name="apertura", description="Apre subito la lotteria (solo admin).")
-async def apertura_slash(interaction: discord.Interaction):
-    member = interaction.user
-    isadm = False
-    if ADMIN_IDS and member.id in ADMIN_IDS:
-        isadm = True
-    elif hasattr(member, "guild_permissions") and member.guild_permissions.administrator:
-        isadm = True
-    if not isadm:
-        await interaction.response.send_message("❌ Non sei autorizzato a usare questo comando.", ephemeral=True)
+    ch = await find_lottery_channel(guild)
+    if not ch:
+        await inter.followup.send("⚠️ Canale lotteria non trovato.", ephemeral=True)
         return
+    await open_lottery(guild)
+    await inter.followup.send(f"📜 Apertura pubblicata in {ch.mention}.")
 
-    await open_lottery(interaction.guild)
-    await interaction.response.send_message("📜 Lotteria **aperta** manualmente (slash).", ephemeral=False)
-
-@bot.tree.command(name="chiusura", description="Chiude la lotteria e calcola il vincitore (solo admin).")
-async def chiusura_slash(interaction: discord.Interaction):
-    member = interaction.user
-    isadm = False
-    if ADMIN_IDS and member.id in ADMIN_IDS:
-        isadm = True
-    elif hasattr(member, "guild_permissions") and member.guild_permissions.administrator:
-        isadm = True
-    if not isadm:
-        await interaction.response.send_message("❌ Non sei autorizzato a usare questo comando.", ephemeral=True)
+@app_commands.check(lambda inter: user_is_admin_interaction(inter))
+@bot.tree.command(name="chiusura", description="Forza la chiusura e il calcolo del vincitore (admin).")
+async def chiusura_slash(inter: discord.Interaction):
+    await inter.response.defer(thinking=True)
+    guild = inter.guild
+    if guild is None:
+        await inter.followup.send("Questo comando va usato in un server.", ephemeral=True)
         return
+    await close_and_pick(guild, announce_now=False)
+    await inter.followup.send("🧾 Lotteria **chiusa**. Vincitore salvato per l'annuncio delle 08:00.")
 
-    await close_and_pick(interaction.guild, announce_now=False)
-    await interaction.response.send_message("🔒 Lotteria **chiusa**. Vincitore salvato per l’annuncio delle 08:00.", ephemeral=False)
-
-@bot.tree.command(name="annuncio", description="Annuncia subito il vincitore salvato (solo admin).")
-async def annuncio_slash(interaction: discord.Interaction):
-    member = interaction.user
-    isadm = False
-    if ADMIN_IDS and member.id in ADMIN_IDS:
-        isadm = True
-    elif hasattr(member, "guild_permissions") and member.guild_permissions.administrator:
-        isadm = True
-    if not isadm:
-        await interaction.response.send_message("❌ Non sei autorizzato a usare questo comando.", ephemeral=True)
+@app_commands.check(lambda inter: user_is_admin_interaction(inter))
+@bot.tree.command(name="annuncio", description="Annuncia il vincitore salvato (admin).")
+async def annuncio_slash(inter: discord.Interaction):
+    await inter.response.defer(thinking=True)
+    guild = inter.guild
+    if guild is None:
+        await inter.followup.send("Questo comando va usato in un server.", ephemeral=True)
         return
-
-    guild = interaction.guild
-    channel = await find_lottery_channel(guild)
-    if not channel:
-        await interaction.response.send_message("⚠️ Canale lotteria non trovato.", ephemeral=True)
+    ch = await find_lottery_channel(guild)
+    if not ch:
+        await inter.followup.send("⚠️ Canale lotteria non trovato.", ephemeral=True)
         return
-
-    lw = STATE.get("last_winner_id")
-    if not lw:
-        await interaction.response.send_message("ℹ️ Nessun vincitore salvato da annunciare.", ephemeral=True)
-        return
-
-    member_obj = None
-    try:
-        member_obj = await guild.fetch_member(lw)
-    except Exception:
-        member_obj = guild.get_member(lw)
-
-    await post_winner_announcement(channel, member_obj)
+    winner_id = STATE.get("last_winner_id")
+    member = None
+    if winner_id:
+        try:
+            member = await guild.fetch_member(winner_id)
+        except Exception:
+            member = guild.get_member(winner_id)
+    await post_winner_announcement(ch, member)
     STATE["last_winner_id"] = None
     save_state(STATE)
-    await interaction.response.send_message("📣 Annuncio del vincitore **pubblicato**.", ephemeral=False)
+    await inter.followup.send("📣 Annuncio pubblicato.")
 
 
 # ---------- Avvio ----------
