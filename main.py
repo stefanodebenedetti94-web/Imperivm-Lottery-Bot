@@ -1,8 +1,10 @@
-# === IMPERIVM Lottery Bot – main.py (Render / discord.py 2.x) ===
-import os
-import json
-import asyncio
-import random
+# === IMPERIVM Lottery Bot — main.py (Render / discord.py 2.x) ===
+# Stato persistito su messaggio pinnato (STATE_MESSAGE_ID) per sopravvivere ai reboot.
+# Auto-schedule: Wed 00:00 apertura, Thu 00:00 chiusura, Thu 08:00 annuncio.
+# Edizione speciale: ogni 4 edizioni (4, 8, 12, …) con premi 600k/800k/1M (+200k se il vincitore ha già vinto in passato).
+# Niente leaderboard. Niente reazione automatica del bot sul messaggio di apertura.
+
+import os, json, asyncio, random
 from datetime import datetime, time
 from threading import Thread
 from typing import Optional, List, Tuple
@@ -24,6 +26,10 @@ except Exception:
 
 app = Flask(__name__)
 
+@app.get("/health")
+def health():
+    return "OK"
+
 @app.get("/")
 def index():
     return "IMPERIVM Lottery Bot è vivo 📜"
@@ -31,9 +37,11 @@ def index():
 def start_web_server():
     port = int(os.getenv("PORT", "8080"))
     if USE_WAITRESS:
-        Thread(target=lambda: serve(app, host="0.0.0.0", port=port), daemon=True).start()
+        Thread(target=lambda: serve(app, host="0.0.0.0", port=port),
+               daemon=True).start()
     else:
-        Thread(target=lambda: app.run(host="0.0.0.0", port=port), daemon=True).start()
+        Thread(target=lambda: app.run(host="0.0.0.0", port=port),
+               daemon=True).start()
 
 # ---------- Config ----------
 INTENTS = discord.Intents.default()
@@ -46,298 +54,159 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("❌ Manca DISCORD_TOKEN nelle Environment Variables di Render.")
 
-# Canale lotteria: puoi lasciare 0 per cercarlo per nome
 LOTTERY_CHANNEL_ID = int(os.getenv("LOTTERY_CHANNEL_ID", "0"))
-LOTTERY_CHANNEL_NAME_CANDIDATES = ["lotteria-imperiale", "lotteria-imperivm"]
-
-# Admin extra (facoltativo). Se vuoto valgono i permessi admin Discord.
-ADMIN_IDS = set()
-_env_admins = os.getenv("ADMINS", "").strip()
-if _env_admins:
-    try:
-        ADMIN_IDS = {int(x) for x in _env_admins.replace(" ", "").split(",") if x}
-    except Exception:
-        ADMIN_IDS = set()
+STATE_MESSAGE_ID = int(os.getenv("STATE_MESSAGE_ID", "0"))
+APP_URL = os.getenv("APP_URL", "").strip()
 
 TZ = pytz.timezone("Europe/Rome")
 GOLD = discord.Color.from_str("#DAA520")
 
-STATE_FILE = "lottery_state.json"
-DEFAULT_STATE = {
-    "edition": 1,
-    "open_message_id": None,
-    "participants": [],
-
-    # livelli correnti (1..3) – reset a 1 dopo la 3°
-    "wins": {},                       # {uid: 1..3}
-    # storico per bonus Special
-    "victories": {},                  # {uid: tot vittorie}
-    "cycles": {},                     # {uid: quante volte ha superato L3 (reset)}
-    "last_win_iso": {},               # {uid: ISO timestamp ultima vittoria}
-
-    "last_winner_id": None,
-
-    # Anti-duplicato cron/watchdog
-    "last_open_week": None,           # "YYYY-WW"
-    "last_close_week": None,
-    "last_announce_week": None,
-
-    # Flag/ausiliari
-    "current_is_special": False,
-    "restored_from_history": False
+# Seed richiesto (edizione 4 con tre vincitori livello 1)
+SEED_WINS = {
+    "277179262534942720": 1,  # Aeries
+    "662291114752999437": 1,  # Sandor
+    "4601937456406200042": 1  # (attenzione: ID corretto sotto, vedi DEFAULT_STATE)
 }
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return DEFAULT_STATE.copy()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k, v in DEFAULT_STATE.items():
-            if k not in data:
-                data[k] = v
-        return data
-    except Exception:
-        return DEFAULT_STATE.copy()
+SCHEMA = "imperivm.lottery.v1"
 
-def save_state(data):
-    try:
-        if os.path.exists(STATE_FILE):
-            os.replace(STATE_FILE, STATE_FILE + ".bak")
-    except Exception:
-        pass
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+DEFAULT_STATE = {
+    "schema": SCHEMA,
+    "edition": 4,                   # si parte già dall'edizione 4
+    "open_message_id": None,
+    "wins": {
+        "277179262534942720": 1,    # Aeries
+        "662291114752999437": 1,    # Sandor
+        "460193745640620042": 1     # Klaudrr (ID corretto)
+    },
+    "victories": {
+        "277179262534942720": 1,
+        "662291114752999437": 1,
+        "460193745640620042": 1
+    },
+    "cycles": {},                   # contatori dei reset (raggiunto L3)
+    "last_win_iso": {},             # ultima vittoria per utente
+    "last_winner_id": None,
 
-STATE = load_state()
-
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
-scheduler = AsyncIOScheduler(timezone=TZ)
-
-# ---------- Utility ----------
-def is_admin(ctx_or_member) -> bool:
-    m = ctx_or_member.author if hasattr(ctx_or_member, "author") else ctx_or_member
-    if ADMIN_IDS and m.id in ADMIN_IDS:
-        return True
-    perms = getattr(m, "guild_permissions", None)
-    return bool(perms and perms.administrator)
-
-async def find_lottery_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
-    if LOTTERY_CHANNEL_ID:
-        ch = guild.get_channel(LOTTERY_CHANNEL_ID)
-        if isinstance(ch, discord.TextChannel):
-            return ch
-    for name in LOTTERY_CHANNEL_NAME_CANDIDATES:
-        for ch in guild.text_channels:
-            if ch.name.lower() == name:
-                return ch
-    return guild.text_channels[0] if guild.text_channels else None
-
-def level_from_wins(wins: int) -> int:
-    if wins <= 0: return 0
-    return min(wins, 3)
-
-def golden_embed(title: str, desc: str) -> discord.Embed:
-    nice_title = "📜  " + title + "  📜"
-    e = discord.Embed(title=nice_title, description=desc, color=GOLD)
-    e.set_footer(text="IMPERIVM • Lotteria settimanale")
-    return e
-
-def week_key(dt: datetime) -> str:
-    iso = dt.isocalendar()  # (year, week, weekday)
-    return f"{iso[0]}-{iso[1]:02d}"
+    # marcatori anti-duplicato (per cron/watchdog)
+    "last_open_week": None,         # "YYYY-WW"
+    "last_close_week": None,
+    "last_announce_week": None,
+}
 
 def now_tz() -> datetime:
     return datetime.now(TZ)
 
-# ---------- Ricostruzione dallo storico ----------
-async def _parse_winner_from_embed(msg: discord.Message) -> Optional[int]:
-    """Ritorna l'ID del vincitore leggendo l'embed dell'annuncio ufficiale."""
-    if not msg.embeds:
-        return None
-    emb = msg.embeds[0]
-    # Il nostro titolo standard:
-    if not emb.title or "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM" not in emb.title:
-        return None
-    # Nel description cerchiamo la riga "Vincitore: <@123...>"
-    if not emb.description:
-        return None
-    text = emb.description
-    # pattern semplice: trova <@...> o <@!...>
-    import re
-    m = re.search(r"<@!?(\d+)>", text)
-    if m:
-        try:
-            return int(m.group(1))
-        except:
-            return None
-    return None
+def week_key(dt: datetime) -> str:
+    iso = dt.isocalendar()
+    return f"{iso[0]}-{iso[1]:02d}"
 
-def _bump_counters_for(uid: str):
-    prev = STATE["wins"].get(uid, 0)
-    newv = prev + 1
-    reset = False
-    if newv > 3:
-        newv = 1
-        reset = True
-    STATE["wins"][uid] = newv
-    STATE["victories"][uid] = STATE["victories"].get(uid, 0) + 1
-    if reset:
-        STATE["cycles"][uid] = STATE["cycles"].get(uid, 0) + 1
-    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
+def level_from_wins(w: int) -> int:
+    if w <= 0: return 0
+    return ((w - 1) % 3) + 1  # livelli 1..3, poi torna a 1
 
-async def restore_from_history_if_needed(guild: discord.Guild, channel: discord.TextChannel, limit: int = 1200):
-    """Se STATE sembra vuoto o è stato resettato, ricostruisce wins/victories leggendo i vecchi annunci."""
-    # Heuristic: se non abbiamo vittorie o se è esplicitamente richiesto, prova a ricostruire
-    if STATE.get("victories") and STATE.get("wins") and STATE.get("restored_from_history"):
+def golden_embed(title: str, desc: str) -> discord.Embed:
+    e = discord.Embed(title=f"📜  {title}  📜", description=desc, color=GOLD)
+    e.set_footer(text="IMPERIVM • Lotteria settimanale")
+    return e
+
+# ---------- Stato su messaggio pinnato ----------
+STATE: dict = DEFAULT_STATE.copy()
+bot = commands.Bot(command_prefix="!", intents=INTENTS)
+scheduler = AsyncIOScheduler(timezone=TZ)
+
+async def _fetch_state_message(guild: discord.Guild) -> Optional[discord.Message]:
+    if not STATE_MESSAGE_ID:
+        return None
+    channel = guild.get_channel(LOTTERY_CHANNEL_ID) if LOTTERY_CHANNEL_ID else None
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    try:
+        msg = await channel.fetch_message(STATE_MESSAGE_ID)
+        return msg
+    except Exception:
+        return None
+
+async def load_state_from_pinned(guild: discord.Guild):
+    global STATE
+    msg = await _fetch_state_message(guild)
+    if not msg:
         return
+    try:
+        raw = msg.content.strip()
+        # consenti formato con blocco code
+        if raw.startswith("```") and raw.endswith("```"):
+            raw = raw.strip("`").split("\n", 1)[1]
+        data = json.loads(raw)
+        if data.get("schema") == SCHEMA:
+            # merge con default per eventuali nuove chiavi
+            merged = DEFAULT_STATE.copy()
+            merged.update(data)
+            STATE = merged
+    except Exception:
+        # se fallisce, mantieni STATE corrente (seed) e sovrascrivi al prossimo save
+        pass
 
-    wins_before = dict(STATE.get("wins", {}))
-    vics_before = dict(STATE.get("victories", {}))
+async def save_state_to_pinned(guild: discord.Guild):
+    msg = await _fetch_state_message(guild)
+    if not msg:
+        return
+    try:
+        payload = json.dumps(STATE, ensure_ascii=False, indent=2)
+        content = f"```json\n{payload}\n```"
+        await msg.edit(content=content)
+    except Exception:
+        pass
 
-    # reset parziale per ricostruire correttamente
-    STATE["wins"] = {}
-    STATE["victories"] = {}
-    STATE["cycles"] = {}
-    STATE["last_win_iso"] = {}
-    STATE["last_winner_id"] = None
+# ---------- Flusso Lotteria ----------
+async def find_lottery_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    ch = guild.get_channel(LOTTERY_CHANNEL_ID) if LOTTERY_CHANNEL_ID else None
+    return ch if isinstance(ch, discord.TextChannel) else None
 
-    count = 0
-    async for msg in channel.history(limit=limit, oldest_first=True):
-        wid = await _parse_winner_from_embed(msg)
-        if wid:
-            _bump_counters_for(str(wid))
-            STATE["last_winner_id"] = wid
-            count += 1
-
-    # Se non abbiamo trovato nulla, ripristina lo stato precedente
-    if count == 0:
-        STATE["wins"] = wins_before
-        STATE["victories"] = vics_before
-    else:
-        STATE["restored_from_history"] = True
-    save_state(STATE)
-
-# ---------- Flusso lotteria ----------
-async def post_open_message(channel: discord.TextChannel, is_special: bool):
+async def post_open_message(channel: discord.TextChannel):
+    global STATE
     edition = STATE["edition"]
 
-    if is_special:
-        lines = [
-            "Cittadini dell’Impero 👑",
-            "Edizione **Speciale**: la Borsa dei Premi è aperta!",
-            "Da ora fino alle 00:00 di giovedì, partecipa reagendo con ✅ e lascia che gli Dei scelgano il fato.",
-            "",
-            "🎁 **Premio casuale**: 600.000 / 800.000 / 1.000.000 Kama",
-            "➕ **Bonus +200.000 Kama** se il vincitore ha già vinto in passato.",
-            "",
-            f"**Edizione n°{edition} — SPECIAL EDITION**",
-            "",
-            "🕗 *Annuncio ufficiale del vincitore giovedì alle **08:00***."
-        ]
-        title = "LOTTERIA IMPERIVM – EDIZIONE SPECIALE"
-    else:
+    special = (edition % 4 == 0)
+    if special:
+        title = "LOTTERIA IMPERIVM — EDIZIONE SPECIALE"
         lines = [
             "Cittadini dell'Impero 👑",
-            "È giunto il momento di sfidare la sorte sotto lo stendardo dorato dell'IMPERIVM!",
-            "Da ora fino alle 00:00 di giovedì, la lotteria imperiale è ufficialmente **aperta**! 🧾",
+            "Questa è un’**Edizione Speciale**: i premi sono maggiorati e il fato è capriccioso!",
+            "Da ora fino alle 00:00 di giovedì, la lotteria è **aperta**.",
             "",
-            "Reagite con ✅ a questo messaggio per partecipare all'estrazione.",
-            "Il destino premierà solo i più audaci!",
+            "Reagite con ✅ a questo messaggio per partecipare.",
+            "",
+            "🎁 Premi casuali: **600.000** / **800.000** / **1.000.000** Kama",
+            "💠 *Bonus*: se hai **già vinto** in passato → **+200.000** Kama sul premio estratto.",
+            "",
+            f"**Edizione n°{edition} (Special)**",
+            "📣 Il verdetto sarà annunciato **giovedì alle 08:00**."
+        ]
+    else:
+        title = "LOTTERIA IMPERIVM — EDIZIONE SETTIMANALE"
+        lines = [
+            "Cittadini dell'Impero 👑",
+            "È il momento di sfidare la sorte sotto lo stendardo bianco e rosso dell’IMPERIVM!",
+            "Da ora fino alle 00:00 di giovedì, la lotteria è **aperta**.",
+            "",
+            "Reagite con ✅ a questo messaggio per partecipare.",
             "",
             "⚔️ Premi in palio:",
-            "  1️⃣ 1ª vittoria → 100.000 Kama",
-            "  2️⃣ 2ª vittoria → Scudo di Gilda *(se già posseduto → 250.000 Kama)*",
-            "  3️⃣ 3ª vittoria → 500.000 Kama *(reset dei livelli)*",
+            "• 1ª vittoria → **100.000** Kama",
+            "• 2ª vittoria → **Scudo di Gilda** *(se già posseduto → **250.000** Kama)*",
+            "• 3ª vittoria → **500.000** Kama *(reset dei livelli)*",
             "",
             f"**Edizione n°{edition}**",
-            "",
-            "🕗 *Annuncio ufficiale del vincitore giovedì alle **08:00***."
+            "📣 Il verdetto sarà annunciato **giovedì alle 08:00**."
         ]
-        title = "LOTTERIA IMPERIVM – EDIZIONE SETTIMANALE"
 
     embed = golden_embed(title, "\n".join(lines))
     msg = await channel.send(embed=embed)
-    # 🔕 Il bot NON aggiunge reazioni: non deve partecipare.
+    # << Non aggiungiamo alcuna reazione automatica >>
     STATE["open_message_id"] = msg.id
-    STATE["participants"] = []
-    save_state(STATE)
+    await save_state_to_pinned(channel.guild)
     return msg
-
-async def post_close_message(channel: discord.TextChannel, no_participants: bool, names_preview: Optional[str]):
-    if no_participants:
-        desc = (
-            "La sorte ha parlato… 😕  **Nessun partecipante valido** questa settimana.\n"
-            "Torniamo mercoledì prossimo! 👑"
-        )
-    else:
-        desc = (
-            "La sorte ha parlato… 🌅  Il verdetto sarà svelato all'alba.\n"
-            "Tutti i biglietti sono stati raccolti, il fato è in bilico tra le mani degli Dei.\n\n"
-        )
-        if names_preview:
-            desc += names_preview + "\n\n"
-        desc += "🕗 *Annuncio del vincitore alle **08:00** di giovedì.*"
-
-    title = "LOTTERIA IMPERIVM – CHIUSA (SPECIALE)" if STATE.get("current_is_special") else "LOTTERIA IMPERIVM – CHIUSA"
-    await channel.send(embed=golden_embed(title, desc))
-
-def _special_prize(total_prev_victories: int) -> int:
-    base = random.choice([600_000, 800_000, 1_000_000])
-    bonus = 200_000 if total_prev_victories > 0 else 0
-    return base + bonus
-
-async def post_winner_announcement(channel: discord.TextChannel, member: Optional[discord.Member]):
-    is_special = STATE.get("current_is_special", False)
-    if member is None:
-        desc = (
-            "I sigilli sono stati spezzati, ma stavolta il fato è rimasto muto.\n"
-            "Nessun nome scolpito negli annali: riproveremo mercoledì prossimo. 🕯️"
-        )
-        title = "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM (SPECIALE)" if is_special else "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM"
-        await channel.send(embed=golden_embed(title, desc))
-        return
-
-    uid = str(member.id)
-
-    if is_special:
-        tot_prev = STATE["victories"].get(uid, 0)
-        prize_amount = _special_prize(tot_prev)
-        # anche nelle speciali registriamo la vittoria e aggiorniamo i livelli “ciclici” 1..3
-        _bump_counters_for(uid)
-        save_state(STATE)
-
-        desc = (
-            "L’Aquila Imperiale ha dispiegato le sue ali e la Borsa dei Premi ha decretato il suo verdetto.\n\n"
-            f"👑 **Vincitore (Special Edition):** {member.mention}\n"
-            f"💎 **Ricompensa:** {prize_amount:,} Kama\n"
-            f"📜 *Bonus Special:* {'attivo (+200.000)' if tot_prev>0 else 'non attivo (prima vittoria)'}\n\n"
-            "La fortuna favorisce gli audaci. La prossima chiamata dell’Imperium risuonerà **mercoledì a mezzanotte**."
-        )
-        title = "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM (SPECIALE)"
-        await channel.send(embed=golden_embed(title, desc))
-        return
-
-    # Classica: usa i livelli
-    wins = STATE["wins"].get(uid, 0)
-    lvl = level_from_wins(wins)
-    if lvl == 1:
-        premio = "100.000 Kama"
-    elif lvl == 2:
-        premio = "Scudo di Gilda *(se già posseduto → 250.000 Kama)*"
-    else:
-        premio = "500.000 Kama *(reset dei livelli)*"
-
-    desc = (
-        "Cittadini dell’Impero, il fato ha parlato e i sigilli sono stati sciolti.\n"
-        "Tra pergamene e ceralacca, il nome inciso negli annali è stato scelto.\n\n"
-        f"👑 **Vincitore:** {member.mention}\n"
-        f"⚔️ **Livello attuale:** {lvl}\n"
-        f"📜 **Ricompensa:** {premio}\n\n"
-        "Che la fortuna continui a sorriderti. La prossima chiamata dell’Aquila Imperiale\n"
-        "risuonerà **mercoledì a mezzanotte**. Presentatevi senza timore."
-    )
-    await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc))
 
 async def collect_participants(msg: discord.Message) -> List[int]:
     ids: List[int] = []
@@ -354,17 +223,80 @@ async def collect_participants(msg: discord.Message) -> List[int]:
     # dedup
     return list(dict.fromkeys(ids))
 
-async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Optional[discord.Member]:
+def _bump_win_counters(uid: str):
+    prev = int(STATE["wins"].get(uid, 0))
+    new = prev + 1
+    reset = False
+    if new > 3:
+        new = 1
+        reset = True
+    STATE["wins"][uid] = new
+    STATE["victories"][uid] = int(STATE["victories"].get(uid, 0)) + 1
+    if reset:
+        STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
+    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
+
+def _special_prize_for(uid: str) -> int:
+    base = random.choice([600_000, 800_000, 1_000_000])
+    if int(STATE["victories"].get(uid, 0)) >= 1:
+        base += 200_000
+    return base
+
+async def post_close_message(channel: discord.TextChannel, no_participants: bool, names_preview: Optional[str]):
+    if no_participants:
+        desc = "😕 Nessun partecipante valido questa settimana. Torniamo mercoledì prossimo!"
+    else:
+        desc = "I biglietti sono stati raccolti: il fato deciderà all’alba.\n"
+        if names_preview:
+            desc += names_preview + "\n"
+        desc += "🕗 Annuncio del vincitore **alle 08:00 di giovedì**."
+    await channel.send(embed=golden_embed("LOTTERIA IMPERIVM — CHIUSA", desc))
+
+async def post_winner_announcement(channel: discord.TextChannel, member: Optional[discord.Member], special: bool):
+    if member is None:
+        await channel.send(embed=golden_embed(
+            "ESTRAZIONE UFFICIALE — LOTTERIA IMPERIVM",
+            "I sigilli sono stati spezzati ma il fato è rimasto muto. Riproveremo mercoledì prossimo."))
+        return
+
+    uid = str(member.id)
+    lvl = level_from_wins(int(STATE["wins"].get(uid, 0)))
+
+    if special:
+        prize = _special_prize_for(uid)
+        body = (
+            f"👑 **Vincitore (Special):** {member.mention}\n"
+            f"🎁 **Ricompensa:** {prize:,} Kama\n"
+            f"⚔️ **Livello attuale:** {lvl}/3"
+        )
+        title = "ESTRAZIONE UFFICIALE — EDIZIONE SPECIALE"
+    else:
+        if lvl == 1:
+            premio = "100.000 Kama"
+        elif lvl == 2:
+            premio = "Scudo di Gilda *(se già posseduto → 250.000 Kama)*"
+        else:
+            premio = "500.000 Kama *(reset dei livelli)*"
+        body = (
+            f"👑 **Vincitore:** {member.mention}\n"
+            f"⚔️ **Livello attuale:** {lvl}/3\n"
+            f"📜 **Ricompensa:** {premio}"
+        )
+        title = "ESTRAZIONE UFFICIALE — LOTTERIA IMPERIVM"
+
+    tail = "\n\nLa prossima chiamata dell’Aquila Imperiale risuonerà **mercoledì a mezzanotte**."
+    await channel.send(embed=golden_embed(title, body + tail))
+
+async def close_and_pick(guild: discord.Guild, announce_now: bool = False):
+    global STATE
     channel = await find_lottery_channel(guild)
     if not channel:
         return None
 
-    # Messaggio apertura
     msg = None
-    msg_id = STATE.get("open_message_id")
-    if msg_id:
+    if STATE.get("open_message_id"):
         try:
-            msg = await channel.fetch_message(msg_id)
+            msg = await channel.fetch_message(STATE["open_message_id"])
         except Exception:
             msg = None
 
@@ -372,7 +304,6 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Op
     if msg:
         participants = await collect_participants(msg)
 
-    # elenco nomi (no mention)
     names_preview = None
     if participants:
         names = []
@@ -386,57 +317,51 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False) -> Op
             body += f"\n…e altri **{more}**."
         names_preview = f"{header}\n{body}"
 
-    no_participants = len(participants) == 0
-    await post_close_message(channel, no_participants, names_preview)
+    await post_close_message(channel, len(participants) == 0, names_preview)
 
-    winner_member: Optional[discord.Member] = None
+    winner_member = None
     STATE["last_winner_id"] = None
 
-    if not no_participants:
+    if participants:
         win_id = random.choice(participants)
         STATE["last_winner_id"] = win_id
-
-        # Aggiorna contatori subito qui per la classica (la Special li aggiorna in annuncio)
-        if not STATE.get("current_is_special", False):
-            _bump_counters_for(str(win_id))
-            save_state(STATE)
-
+        _bump_win_counters(str(win_id))
+        await save_state_to_pinned(guild)
         try:
             winner_member = await guild.fetch_member(win_id)
         except Exception:
             winner_member = guild.get_member(win_id)
 
-    if announce_now:
-        await post_winner_announcement(channel, winner_member)
-
+    # chiudo edizione
     STATE["open_message_id"] = None
-    save_state(STATE)
+    await save_state_to_pinned(guild)
+
+    if announce_now:
+        special = (STATE["edition"] % 4 == 0)
+        await post_winner_announcement(channel, winner_member, special)
+
     return winner_member
 
-async def open_lottery(guild: discord.Guild, force_special: bool = False):
+async def open_lottery(guild: discord.Guild):
+    global STATE
     channel = await find_lottery_channel(guild)
     if not channel:
         return
 
-    # evita doppio open
+    # evita doppia apertura se già c'è il messaggio "vivo"
     if STATE.get("open_message_id"):
         try:
             await channel.fetch_message(STATE["open_message_id"])
             return
         except Exception:
-            pass
+            STATE["open_message_id"] = None
 
-    # Edizione speciale ogni 4 (4,8,12,...) oppure forzata
-    ed = STATE["edition"]
-    is_special = force_special or (ed % 4 == 0)
-    STATE["current_is_special"] = is_special
-    save_state(STATE)
-
-    await post_open_message(channel, is_special)
+    await post_open_message(channel)
+    # incremento edizione SUBITO dopo aver aperto (così il contatore va alla prossima)
     STATE["edition"] += 1
-    save_state(STATE)
+    await save_state_to_pinned(guild)
 
-# ---------- Scheduling (cron + watchdog) ----------
+# ---------- Schedulazione ----------
 def schedule_weekly_jobs():
     trig_open     = CronTrigger(day_of_week="wed", hour=0, minute=0, timezone=TZ)
     trig_close    = CronTrigger(day_of_week="thu", hour=0, minute=0, timezone=TZ)
@@ -444,82 +369,80 @@ def schedule_weekly_jobs():
 
     async def do_open():
         for g in bot.guilds:
-            ch = await find_lottery_channel(g)
-            if ch:
-                # prima di aprire, prova a ricostruire dallo storico se serve
-                await restore_from_history_if_needed(g, ch)
+            await load_state_from_pinned(g)  # sempre ricaricare prima
             await open_lottery(g)
-            STATE["last_open_week"] = week_key(now_tz()); save_state(STATE)
+            STATE["last_open_week"] = week_key(now_tz())
+            await save_state_to_pinned(g)
 
     async def do_close():
         for g in bot.guilds:
+            await load_state_from_pinned(g)
             await close_and_pick(g, announce_now=False)
-            STATE["last_close_week"] = week_key(now_tz()); save_state(STATE)
+            STATE["last_close_week"] = week_key(now_tz())
+            await save_state_to_pinned(g)
 
     async def do_announce():
         for g in bot.guilds:
+            await load_state_from_pinned(g)
             ch = await find_lottery_channel(g)
-            if not ch: 
+            if not ch:
                 continue
             lw = STATE.get("last_winner_id")
             member = None
             if lw:
-                try:
-                    member = await g.fetch_member(lw)
-                except Exception:
-                    member = g.get_member(lw)
-            await post_winner_announcement(ch, member)
+                try: member = await g.fetch_member(lw)
+                except Exception: member = g.get_member(lw)
+            special = ((STATE["edition"] - 1) % 4 == 0)  # l'edizione annunciata è quella appena conclusa
+            await post_winner_announcement(ch, member, special)
             STATE["last_announce_week"] = week_key(now_tz())
             STATE["last_winner_id"] = None
-            STATE["current_is_special"] = False
-            save_state(STATE)
+            await save_state_to_pinned(g)
 
     scheduler.add_job(lambda: asyncio.create_task(do_open()), trig_open)
     scheduler.add_job(lambda: asyncio.create_task(do_close()), trig_close)
     scheduler.add_job(lambda: asyncio.create_task(do_announce()), trig_announce)
 
-    # WATCHDOG (ogni 5 min) per recuperare eventi mancati
+    # Watchdog ogni 5 minuti per recuperare task mancati
     async def watchdog():
         dt = now_tz()
         wk = week_key(dt)
-        wd = dt.weekday()  # Mon=0 ... Sun=6
+        wd = dt.weekday()   # Mon=0 ... Sun=6
         t  = dt.time()
 
-        # Apertura mercoledì 00:00
         if wd == 2 and t >= time(0,0) and STATE.get("last_open_week") != wk:
             for g in bot.guilds:
-                ch = await find_lottery_channel(g)
-                if ch:
-                    await restore_from_history_if_needed(g, ch)
+                await load_state_from_pinned(g)
                 await open_lottery(g)
-            STATE["last_open_week"] = wk; save_state(STATE); return
+                STATE["last_open_week"] = wk
+                await save_state_to_pinned(g)
+            return
 
-        # Chiusura giovedì 00:00
         if wd == 3 and t >= time(0,0) and STATE.get("last_close_week") != wk:
             for g in bot.guilds:
+                await load_state_from_pinned(g)
                 await close_and_pick(g, announce_now=False)
-            STATE["last_close_week"] = wk; save_state(STATE); return
+                STATE["last_close_week"] = wk
+                await save_state_to_pinned(g)
+            return
 
-        # Annuncio giovedì 08:00
         if wd == 3 and t >= time(8,0) and STATE.get("last_announce_week") != wk:
             for g in bot.guilds:
+                await load_state_from_pinned(g)
                 ch = await find_lottery_channel(g)
-                if not ch: 
-                    continue
+                if not ch: continue
                 lw = STATE.get("last_winner_id")
                 member = None
                 if lw:
-                    try:
-                        member = await g.fetch_member(lw)
-                    except Exception:
-                        member = g.get_member(lw)
-                await post_winner_announcement(ch, member)
-            STATE["last_announce_week"] = wk
-            STATE["last_winner_id"] = None
-            STATE["current_is_special"] = False
-            save_state(STATE)
+                    try: member = await g.fetch_member(lw)
+                    except Exception: member = g.get_member(lw)
+                special = ((STATE["edition"] - 1) % 4 == 0)
+                await post_winner_announcement(ch, member, special)
+                STATE["last_announce_week"] = wk
+                STATE["last_winner_id"] = None
+                await save_state_to_pinned(g)
 
-    scheduler.add_job(lambda: asyncio.create_task(watchdog()), "interval", minutes=5, timezone=TZ)
+    scheduler.add_job(lambda: asyncio.create_task(watchdog()),
+                      "interval", minutes=5, timezone=TZ)
 
 # ---------- Eventi ----------
 @bot.event
@@ -528,166 +451,114 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
     except Exception:
         pass
-
-    # tentativo di restore immediato sul canale lotteria
+    # all'avvio, carica stato dal messaggio pinnato del primo server
     for g in bot.guilds:
-        ch = await find_lottery_channel(g)
-        if ch:
-            await restore_from_history_if_needed(g, ch)
-
-    print(f"✅ Bot online come {bot.user} — edizione corrente: {STATE['edition']}")
+        await load_state_from_pinned(g)
+        break
     if not scheduler.running:
         schedule_weekly_jobs()
         scheduler.start()
+    print(f"✅ Bot online come {bot.user} — edizione corrente: {STATE['edition']}")
 
-# ---------- Comandi testuali (facoltativi) ----------
+# ---------- Comandi testo (debug/utility) ----------
 @bot.command(name="whoami")
 async def whoami(ctx: commands.Context):
-    adm = "sì" if is_admin(ctx) else "no"
-    await ctx.reply(f"ID: {ctx.author.id} — sei admin: {adm}", mention_author=False)
+    await ctx.reply(f"ID: {ctx.author.id}", mention_author=False)
 
-# ---------- Slash commands ----------
-def _slash_admin_guard(inter: discord.Interaction) -> bool:
-    if ADMIN_IDS and inter.user.id in ADMIN_IDS:
-        return True
+@bot.command(name="mostralivelli")
+async def mostralivelli(ctx: commands.Context):
+    wins = STATE.get("wins", {})
+    if not wins:
+        await ctx.reply("📜 Nessun livello registrato al momento.", mention_author=False); return
+    lines = []
+    for uid, w in wins.items():
+        member = ctx.guild.get_member(int(uid))
+        tag = member.mention if member else f"<@{uid}>"
+        lines.append(f"{tag}: livello attuale = {level_from_wins(int(w))}/3 • vittorie totali = {STATE['victories'].get(uid,0)}")
+    await ctx.reply(embed=golden_embed("REGISTRO LIVELLI (corrente)", "\n".join(lines)), mention_author=False)
+
+# ---------- Slash (admin) ----------
+def _admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and perms.administrator)
 
-@bot.tree.command(name="mostralivelli", description="Mostra i livelli correnti (1..3) dei vincitori registrati.")
-async def slash_mostralivelli(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
-        await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    wins = STATE.get("wins", {})
-    if not wins:
-        await inter.response.send_message("📜 Nessun livello registrato al momento.", ephemeral=True); return
-    lines = []
-    for uid, w in wins.items():
-        try:
-            m = inter.guild.get_member(int(uid))
-            name = m.display_name if m else f"utente {uid}"
-        except:
-            name = f"utente {uid}"
-        lines.append(f"• {name}: **Livello {level_from_wins(w)}** (vittorie cicliche)")
-    emb = golden_embed("REGISTRO LIVELLI (corrente)", "\n".join(lines))
-    await inter.response.send_message(embed=emb)
-
-@bot.tree.command(name="setwin", description="Registra manualmente una vittoria (aggiorna livelli/bonus interni).")
+@bot.tree.command(name="setwin", description="Registra manualmente una vittoria per un utente.")
 @app_commands.describe(utente="Seleziona l'utente vincitore da registrare")
 async def slash_setwin(inter: discord.Interaction, utente: discord.Member):
-    if not _slash_admin_guard(inter):
+    if not _admin(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    uid = str(utente.id)
-    _bump_counters_for(uid)
-    save_state(STATE)
-    lvl = level_from_wins(STATE["wins"].get(uid, 0))
-    tot = STATE["victories"].get(uid, 0)
-    cyc = STATE["cycles"].get(uid, 0)
-    await inter.response.send_message(
-        f"✅ Registrata vittoria per **{utente.display_name}** — Livello attuale: {lvl} • Vittorie totali: {tot} • Cicli: {cyc}"
-    )
+    await inter.response.defer(thinking=True)
+    _bump_win_counters(str(utente.id))
+    await save_state_to_pinned(inter.guild)
+    lvl = level_from_wins(int(STATE["wins"].get(str(utente.id), 0)))
+    await inter.followup.send(f"✅ Registrata vittoria per **{utente.display_name}** — livello attuale {lvl}/3")
 
-@bot.tree.command(name="setedition", description="Imposta manualmente il numero dell'edizione corrente.")
-@app_commands.describe(numero="Numero edizione da impostare (>=1)")
+@bot.tree.command(name="setedition", description="Imposta manualmente il numero di edizione.")
+@app_commands.describe(numero="Numero di edizione (es. 4)")
 async def slash_setedition(inter: discord.Interaction, numero: int):
-    if not _slash_admin_guard(inter):
+    if not _admin(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    if numero < 1:
-        await inter.response.send_message("⚠️ L'edizione deve essere ≥ 1.", ephemeral=True); return
-    STATE["edition"] = numero
-    save_state(STATE)
-    await inter.response.send_message(f"🔧 Edizione impostata a **n°{numero}**.")
+    await inter.response.defer(thinking=True)
+    STATE["edition"] = int(numero)
+    await save_state_to_pinned(inter.guild)
+    await inter.followup.send(f"📌 Edizione impostata a **{numero}**.")
 
-@bot.tree.command(name="apertura", description="Forza l'apertura della lotteria (classica).")
+@bot.tree.command(name="apertura", description="Forza l'apertura della lotteria (classica/speciale in base all'edizione corrente).")
 async def slash_apertura(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
+    if not _admin(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
     await inter.response.defer(thinking=True)
-    ch = await find_lottery_channel(inter.guild)
-    if not ch:
-        await inter.followup.send("⚠️ Canale lotteria non trovato."); return
-    await restore_from_history_if_needed(inter.guild, ch)
-    STATE["current_is_special"] = False
-    await open_lottery(inter.guild, force_special=False)
-    STATE["last_open_week"] = week_key(now_tz()); save_state(STATE)
-    await inter.followup.send("📜 Apertura (classica) forzata eseguita.")
+    await load_state_from_pinned(inter.guild)
+    await open_lottery(inter.guild)
+    STATE["last_open_week"] = week_key(now_tz())
+    await save_state_to_pinned(inter.guild)
+    await inter.followup.send("📜 Apertura forzata eseguita.")
 
-@bot.tree.command(name="chiusura", description="Forza la chiusura + selezione vincitore (classica/speciale).")
+@bot.tree.command(name="chiusura", description="Forza la chiusura e l’estrazione.")
 async def slash_chiusura(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
+    if not _admin(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
     await inter.response.defer(thinking=True)
+    await load_state_from_pinned(inter.guild)
     await close_and_pick(inter.guild, announce_now=False)
-    STATE["last_close_week"] = week_key(now_tz()); save_state(STATE)
+    STATE["last_close_week"] = week_key(now_tz())
+    await save_state_to_pinned(inter.guild)
     await inter.followup.send("🗝️ Chiusura forzata eseguita.")
 
-@bot.tree.command(name="annuncio", description="Forza l'annuncio del vincitore (classica/speciale).")
+@bot.tree.command(name="annuncio", description="Forza l’annuncio del vincitore.")
 async def slash_annuncio(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
+    if not _admin(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
     await inter.response.defer(thinking=True)
+    await load_state_from_pinned(inter.guild)
     ch = await find_lottery_channel(inter.guild)
     if not ch:
         await inter.followup.send("⚠️ Canale lotteria non trovato."); return
     lw = STATE.get("last_winner_id")
     member = None
     if lw:
-        try:
-            member = await inter.guild.fetch_member(lw)
-        except Exception:
-            member = inter.guild.get_member(lw)
-    await post_winner_announcement(ch, member)
+        try: member = await inter.guild.fetch_member(lw)
+        except Exception: member = inter.guild.get_member(lw)
+    # l’edizione “annunciata” è quella appena conclusa (edition-1)
+    special = ((STATE["edition"] - 1) % 4 == 0)
+    await post_winner_announcement(ch, member, special)
     STATE["last_announce_week"] = week_key(now_tz())
     STATE["last_winner_id"] = None
-    STATE["current_is_special"] = False
-    save_state(STATE)
+    await save_state_to_pinned(inter.guild)
     await inter.followup.send("📣 Annuncio forzato eseguito.")
 
-# --- Speciale: forzati ---
-@bot.tree.command(name="aperturaspeciale", description="Forza l'apertura dell'Edizione Speciale.")
+# Alias “speciali” espliciti (stesse azioni ma messaggi seguiranno l’edizione corrente)
+@bot.tree.command(name="apertura_speciale", description="Forza apertura come speciale (usa l’edizione corrente).")
 async def slash_apertura_speciale(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
-        await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    await inter.response.defer(thinking=True)
-    ch = await find_lottery_channel(inter.guild)
-    if not ch:
-        await inter.followup.send("⚠️ Canale lotteria non trovato."); return
-    await restore_from_history_if_needed(inter.guild, ch)
-    await open_lottery(inter.guild, force_special=True)
-    STATE["last_open_week"] = week_key(now_tz()); save_state(STATE)
-    await inter.followup.send("📜 Apertura **Special Edition** forzata eseguita.")
+    await slash_apertura(inter)
 
-@bot.tree.command(name="chiusuraspeciale", description="Forza la chiusura dell'Edizione Speciale.")
+@bot.tree.command(name="chiusura_speciale", description="Forza chiusura come speciale.")
 async def slash_chiusura_speciale(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
-        await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    await inter.response.defer(thinking=True)
-    STATE["current_is_special"] = True
-    await close_and_pick(inter.guild, announce_now=False)
-    STATE["last_close_week"] = week_key(now_tz()); save_state(STATE)
-    await inter.followup.send("🗝️ Chiusura **Special Edition** forzata eseguita.")
+    await slash_chiusura(inter)
 
-@bot.tree.command(name="annunciospeciale", description="Forza l'annuncio dell'Edizione Speciale.")
+@bot.tree.command(name="annuncio_speciale", description="Forza annuncio come speciale.")
 async def slash_annuncio_speciale(inter: discord.Interaction):
-    if not _slash_admin_guard(inter):
-        await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True); return
-    await inter.response.defer(thinking=True)
-    ch = await find_lottery_channel(inter.guild)
-    if not ch:
-        await inter.followup.send("⚠️ Canale lotteria non trovato."); return
-    lw = STATE.get("last_winner_id")
-    member = None
-    if lw:
-        try:
-            member = await inter.guild.fetch_member(lw)
-        except Exception:
-            member = inter.guild.get_member(lw)
-    STATE["current_is_special"] = True
-    await post_winner_announcement(ch, member)
-    STATE["last_announce_week"] = week_key(now_tz())
-    STATE["last_winner_id"] = None
-    STATE["current_is_special"] = False
-    save_state(STATE)
-    await inter.followup.send("📣 Annuncio **Special Edition** forzato eseguito.")
+    await slash_annuncio(inter)
 
 # ---------- Avvio ----------
 @bot.event
@@ -698,5 +569,5 @@ async def setup_hook():
         pass
 
 if __name__ == "__main__":
-    start_web_server()  # server HTTP per Render
+    start_web_server()
     bot.run(TOKEN)
