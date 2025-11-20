@@ -543,14 +543,24 @@ async def slash_setwin(inter: discord.Interaction, utente: discord.Member):
     if not _slash_admin_guard(inter):
         await inter.response.send_message("❌ Non sei autorizzato.", ephemeral=True)
         return
+
     uid = str(utente.id)
+
+    # aggiorna livelli / vittorie / cicli
     _bump_win_counters(uid)
+
+    # IMPORTANTISSIMO: setto il vincitore corrente per il comando /annuncio
+    STATE["last_winner_id"] = utente.id
+
     save_state()
+
     lvl = level_from_wins(STATE["wins"].get(uid, 0))
     tot = STATE["victories"].get(uid, 0)
     cyc = STATE["cycles"].get(uid, 0)
+
     await inter.response.send_message(
-        f"✅ Registrata vittoria per **{utente.display_name}** — Livello attuale: {lvl} • Vittorie totali: {tot} • Cicli: {cyc}",
+        f"✅ Registrata vittoria per **{utente.display_name}** — Livello attuale: {lvl} • Vittorie totali: {tot} • Cicli: {cyc}\n"
+        f"(Puoi ora usare `/annuncio` per pubblicare l'embed del vincitore.)",
         ephemeral=True
     )
 
