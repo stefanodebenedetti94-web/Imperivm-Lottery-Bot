@@ -441,20 +441,42 @@ async def slash_mostraedizione(inter: discord.Interaction):
 
 @bot.tree.command(name="mostralivelli", description="Mostra i livelli/vittorie registrati.")
 async def slash_mostralivelli(inter: discord.Interaction):
+    if not inter.guild:
+        await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
+    # Defer: evita "L'applicazione non ha risposto"
+    await inter.response.defer(ephemeral=True, thinking=True)
+
     wins = STATE.get("wins", {})
     if not wins:
-        await inter.response.send_message("📜 Nessun livello registrato al momento.", ephemeral=True)
+        await inter.followup.send("📜 Nessun livello registrato al momento.", ephemeral=True)
         return
+
+    # Ordina: più vittorie sopra
+    items = sorted(wins.items(), key=lambda x: (-int(x[1]), int(x[0])))
+
     lines = []
-    for uid, w in wins.items():
-        try:
-            member = await inter.guild.fetch_member(int(uid))
-        except Exception:
-            member = inter.guild.get_member(int(uid))
+    for uid, w in items:
+        uid_int = int(uid)
+        w_int = int(w)
+
+        # Usa cache (veloce). NIENTE fetch_member in loop (lento e fa scadere l'interaction)
+        member = inter.guild.get_member(uid_int)
         tag = member.mention if member else f"<@{uid}>"
-        lines.append(f"{tag}: vittorie (livello) = {w} → Livello attuale: {level_from_wins(w)}")
-    embed = golden_embed("REGISTRO LIVELLI (corrente)", "\n".join(lines))
-    await inter.response.send_message(embed=embed, ephemeral=True)
+
+        lines.append(f"{tag}: vittorie (livello) = **{w_int}** → Livello attuale: **{level_from_wins(w_int)}**")
+
+    # Paginazione per non sforare limiti embed
+    PAGE_SIZE = 20
+    pages = [lines[i:i+PAGE_SIZE] for i in range(0, len(lines), PAGE_SIZE)]
+
+    for idx, page in enumerate(pages, start=1):
+        embed = golden_embed(
+            f"REGISTRO LIVELLI (corrente) — Pag. {idx}/{len(pages)}",
+            "\n".join(page)
+        )
+        await inter.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="setedition", description="Imposta manualmente il numero di edizione (solo admin).")
 @app_commands.describe(numero="Numero edizione da impostare (>=1). È la PROSSIMA edizione che aprirai.")
