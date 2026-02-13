@@ -3,19 +3,21 @@
 # Edizione speciale SOLO quando usi /aperturaspeciale
 #
 # ✅ MODIFICHE APPLICATE (NUOVE):
-# - Progressione livelli corretta:
-#   * default = Livello 1 (se non esisti in STATE["wins"])
-#   * se vinci: 1 -> 2 -> 3 -> 1 (reset immediato quando vinci da Livello 3)
-# - Premio Livello 2 = SOLO 250.000 Kama (niente scudo)
-# - Elemento STRENGTH:
-#   * premio x2 calcolato sul LIVELLO ATTUALE (non sul "prossimo")
-#   * livello NON avanza, MA se vinci da Livello 3 resetti comunque a Livello 1 (coerenza/anti-exploit)
+# - Premio calcolato SEMPRE sul livello PRIMA della vittoria (prev level), poi aggiornamento livello.
+# - Livelli: default = Livello 1 se non esisti in STATE["wins"]
+# - Progressione CLASSICA: 1 -> 2 -> 3 -> 1 (reset immediato quando vinci da Livello 3)
+# - Livello 2 = SOLO 250.000 Kama (niente scudo)
+# - STRENGTH:
+#   * premio x2 sul livello PRIMA della vittoria
+#   * livello NON avanza per L1/L2
+#   * se vinci da L3 => reset a L1 (anti-exploit)
 #   * aggiorna last_win_iso sempre
-# - Edizione SPECIALE:
+# - SPECIALE:
 #   * premio casuale 600k/800k/1M, NESSUN bonus fedeltà
-#   * NON cambia livelli / vittorie / cicli
+#   * NON cambia livelli/vittorie/cicli
 #   * aggiorna last_win_iso (per sorte truccata)
-# - /mostralivelli e /pubblicalivelli: mostrano solo chi è registrato in wins (come prima)
+#   * il premio speciale viene "bloccato" in chiusura (non ricalcolato all'annuncio)
+# - /mostralivelli e /pubblicalivelli: mostrano solo chi è registrato in wins
 
 import os
 import json
@@ -112,6 +114,14 @@ DEFAULT_STATE = {
     "last_winner_id": None,
     "last_winner_ids": [],
 
+    # ✅ NUOVO: livello "prima della vittoria" usato per calcolare premio (per annuncio corretto)
+    "last_winner_prev_levels": {},   # {uid: prev_level}
+    # ✅ NUOVO: flag reset per Strength (solo informativo in annuncio)
+    "last_winner_reset_flags": {},   # {uid: bool}
+
+    # ✅ NUOVO: premio speciale bloccato in chiusura
+    "last_special_prize": None,      # int (kama)
+
     # Modificatori
     "weekly_modifier": None,
     "weekly_modifier_week": None,
@@ -165,6 +175,10 @@ def load_state_from_gist() -> Dict:
             parsed["cycles"] = {}
         if not isinstance(parsed.get("last_win_iso"), dict):
             parsed["last_win_iso"] = {}
+        if not isinstance(parsed.get("last_winner_prev_levels"), dict):
+            parsed["last_winner_prev_levels"] = {}
+        if not isinstance(parsed.get("last_winner_reset_flags"), dict):
+            parsed["last_winner_reset_flags"] = {}
 
         return parsed
     except Exception:
@@ -242,7 +256,7 @@ def remember_name(uid: int, display_name: str):
 def name_fallback(uid: int) -> str:
     return STATE.get("names", {}).get(str(uid), f"utente {uid}")
 
-# ---------- Livelli (NUOVA LOGICA) ----------
+# ---------- Livelli (LOGICA CORRETTA) ----------
 
 def get_level(uid: str) -> int:
     """
@@ -283,33 +297,32 @@ def base_prize_text_for_level(lvl: int) -> str:
         return "250.000 Kama"
     return "500.000 Kama *(reset a Livello 1)*"
 
-def advance_level_on_win(uid: str) -> Tuple[int, int, bool]:
+def advance_level_after_classic_win(uid: str, prev_lvl: int) -> Tuple[int, bool]:
     """
-    Progressione: 1->2->3->1.
-    Ritorna (prev_lvl, new_lvl, did_cycle_reset)
+    Dopo aver pagato il premio sul prev_lvl:
+    1->2, 2->3, 3->1 (cycle reset su 3->1)
+    Ritorna (new_lvl, did_cycle_reset)
     """
-    prev = get_level(uid)
-    if prev == 1:
+    if prev_lvl == 1:
         new = 2
         cycle = False
-    elif prev == 2:
+    elif prev_lvl == 2:
         new = 3
         cycle = False
     else:
         new = 1
         cycle = True
     set_level(uid, new)
-    return prev, new, cycle
+    return new, cycle
 
-def apply_classic_win(uid: str):
+def apply_classic_win_after_prize(uid: str, prev_lvl: int):
     """
     CLASSICA (normale/int/agi/chance):
-    - avanza livello con regola 1->2->3->1
-    - incrementa victories
-    - incrementa cycles solo se 3->1
-    - aggiorna last_win_iso
+    - premio calcolato su prev_lvl (gestito in annuncio)
+    - qui aggiorniamo SOLO lo stato post-vittoria
     """
-    prev, new, cycle = advance_level_on_win(uid)
+    new, cycle = advance_level_after_classic_win(uid, prev_lvl)
+
     STATE.setdefault("victories", {})
     STATE.setdefault("cycles", {})
     STATE.setdefault("last_win_iso", {})
@@ -319,25 +332,23 @@ def apply_classic_win(uid: str):
         STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
     STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
 
-def apply_strength_win(uid: str) -> Tuple[int, int, bool]:
+def apply_strength_win_after_prize(uid: str, prev_lvl: int) -> Tuple[int, bool]:
     """
     STRENGTH:
-    - premio x2 sul livello attuale
-    - livello non avanza
-    - MA se livello 3 => reset a livello 1 (coerenza)
-    - incrementa victories
-    - incrementa cycles se 3->1
-    - aggiorna last_win_iso
-    Ritorna (prev_lvl, new_lvl, did_reset)
+    - premio x2 calcolato su prev_lvl (gestito in annuncio)
+    - livello non avanza per L1/L2
+    - se prev_lvl == 3 => reset a L1
+    Ritorna (new_lvl, did_reset)
     """
-    prev = get_level(uid)
     did_reset = False
-    if prev == 3:
+    if prev_lvl == 3:
         set_level(uid, 1)
         did_reset = True
         new = 1
     else:
-        new = prev
+        # rimane fermo
+        set_level(uid, prev_lvl)
+        new = prev_lvl
 
     STATE.setdefault("victories", {})
     STATE.setdefault("cycles", {})
@@ -347,7 +358,7 @@ def apply_strength_win(uid: str) -> Tuple[int, int, bool]:
     if did_reset:
         STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
     STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
-    return prev, new, did_reset
+    return new, did_reset
 
 def update_last_win_iso_only(uid: str):
     STATE.setdefault("last_win_iso", {})
@@ -388,7 +399,7 @@ def modifier_open_block(mod: str) -> List[str]:
     if mod == MOD_STR:
         return [
             "💪 **MODIFICATORE ATTIVO — ELEMENTO STRENGTH**",
-            "Premio raddoppiato — livello non avanza",
+            "Premio raddoppiato — livello non avanza (L1/L2)",
             "Se vinci da Livello 3 → reset immediato a Livello 1",
         ]
     return ["⚙️ **MODIFICATORE ATTIVO:** NESSUNO"]
@@ -506,6 +517,9 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
     ids: List[int] = STATE.get("last_winner_ids") or []
     mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
 
+    prev_levels: Dict[str, int] = STATE.get("last_winner_prev_levels", {}) or {}
+    reset_flags: Dict[str, bool] = STATE.get("last_winner_reset_flags", {}) or {}
+
     if not ids:
         desc = (
             "Cittadini dell’Impero,\n"
@@ -525,7 +539,12 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
         else:
             mention = f"@{name_fallback(uid_int)}"
 
-        # livello attuale (dopo chiusura, quindi già applicato allo stato)
+        # ✅ livello usato per calcolare premio (PRE-vittoria)
+        prev_lvl = int(prev_levels.get(uid, 1))
+        if prev_lvl < 1: prev_lvl = 1
+        if prev_lvl > 3: prev_lvl = 3
+
+        # ✅ livello attuale post-update (per info)
         lvl_now = get_level(uid)
 
         # Header base
@@ -533,7 +552,8 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
             title = f"ESTRAZIONE {'I' if idx == 1 else 'II'} – LOTTERIA IMPERIVM"
             header = (
                 f"👑 **Vincitore {'I' if idx == 1 else 'II'}:** {mention}\n"
-                f"🎖️ **Livello attuale:** {lvl_now}\n\n"
+                f"🎖️ **Livello (prima della vittoria):** {prev_lvl}\n"
+                f"📌 **Nuovo livello:** {lvl_now}\n\n"
             )
         else:
             title = "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM"
@@ -541,14 +561,13 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
                 "Cittadini dell’Impero,\n"
                 "i sigilli sono stati spezzati e il Fato ha pronunciato il suo verdetto.\n\n"
                 f"👑 **Vincitore:** {mention}\n"
-                f"🎖️ **Livello attuale:** {lvl_now}\n\n"
+                f"🎖️ **Livello (prima della vittoria):** {prev_lvl}\n"
+                f"📌 **Nuovo livello:** {lvl_now}\n\n"
             )
 
-        # premio base in funzione del livello "che ha ora"
-        base_amt = base_prize_amount_for_level(lvl_now)
-        base_txt = base_prize_text_for_level(lvl_now)
+        base_amt = base_prize_amount_for_level(prev_lvl)
+        base_txt = base_prize_text_for_level(prev_lvl)
 
-        # blocchi per mod
         if mod == MOD_INT:
             final_amt = int(round(base_amt * 1.30))
             body = (
@@ -577,13 +596,13 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
             return
 
         if mod == MOD_STR:
-            # Nota: per Strength il livello non avanza, ma se era 3 è stato resettato in chiusura.
-            # Qui il livello "attuale" è già quello finale.
             final_amt = base_amt * 2
+            did_reset = bool(reset_flags.get(uid, False))
+            extra = "✅ Reset a Livello 1 applicato" if did_reset else "Livello fermo (non avanza)"
             body = (
                 "💪 **Elemento Strength attivo**\n\n"
                 f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
-                "Premio raddoppiato — livello non avanza (se eri Livello 3 → reset a Livello 1)"
+                f"📌 {extra}"
             )
             await channel.send(embed=golden_embed(title, header + body))
             return
@@ -613,8 +632,14 @@ async def post_winner_announcement_special(channel: discord.TextChannel, guild: 
     else:
         mention = f"@{name_fallback(winner_id)}"
 
-    premio = _special_compute_prize()
-    lvl = get_level(str(winner_id))  # solo informativo, non viene alterato
+    # ✅ premio speciale bloccato in chiusura
+    premio = STATE.get("last_special_prize")
+    if not isinstance(premio, int) or premio <= 0:
+        premio = _special_compute_prize()
+        STATE["last_special_prize"] = premio
+        save_state()
+
+    lvl = get_level(str(winner_id))  # solo informativo
     desc = (
         "Cittadini dell’Impero, il sigillo dorato è stato infranto.\n"
         "Tra pergamene e ceralacca, il nome inciso negli annali è stato scelto.\n\n"
@@ -665,7 +690,6 @@ def weighted_pick(participants: List[int], mod: Optional[str]) -> int:
     if not participants:
         raise ValueError("participants empty")
 
-    # min livello nel pool
     min_lvl = 99
     for uid_int in participants:
         uid = str(uid_int)
@@ -723,39 +747,55 @@ async def _close_and_pick_common(guild: discord.Guild, special: bool):
     winners: List[int] = []
     mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
 
+    # reset snapshot annuncio
+    STATE["last_winner_prev_levels"] = {}
+    STATE["last_winner_reset_flags"] = {}
+    STATE["last_special_prize"] = None
+
     if participants:
         if special:
-            # SPECIALE: 1 winner, NON cambia livelli/vittorie/cicli, aggiorna solo last_win_iso
             win_id = random.choice(participants)
             winners = [win_id]
+
+            # speciale: non cambia livelli/stats, aggiorna solo last_win_iso
             update_last_win_iso_only(str(win_id))
+            # blocca premio speciale ORA (coerenza)
+            STATE["last_special_prize"] = _special_compute_prize()
             save_state()
+
         else:
             # CLASSICA
             if mod == MOD_CHA and len(participants) >= 2:
-                first = weighted_pick(participants, mod=None)  # chance non altera pesi
+                first = weighted_pick(participants, mod=None)
                 remaining = [x for x in participants if x != first]
                 second = weighted_pick(remaining, mod=None)
                 winners = [first, second]
 
-                # entrambi: progressione normale
-                apply_classic_win(str(first))
-                apply_classic_win(str(second))
+                for wid in winners:
+                    uid = str(wid)
+                    prev_lvl = get_level(uid)  # ✅ premio su questo
+                    STATE["last_winner_prev_levels"][uid] = prev_lvl
+                    # Chance: progressione normale dopo premio
+                    apply_classic_win_after_prize(uid, prev_lvl)
                 save_state()
+
             else:
                 win_id = weighted_pick(participants, mod=mod)
                 winners = [win_id]
+                uid = str(win_id)
+
+                prev_lvl = get_level(uid)  # ✅ premio su questo
+                STATE["last_winner_prev_levels"][uid] = prev_lvl
 
                 if mod == MOD_STR:
-                    # strength: livello non avanza, ma se era 3 resetta a 1
-                    apply_strength_win(str(win_id))
+                    # Strength: fermo su L1/L2, reset se L3
+                    _, did_reset = apply_strength_win_after_prize(uid, prev_lvl)
+                    STATE["last_winner_reset_flags"][uid] = did_reset
                     save_state()
                 else:
-                    # normale/int/agi: progressione 1->2->3->1
-                    apply_classic_win(str(win_id))
+                    apply_classic_win_after_prize(uid, prev_lvl)
                     save_state()
 
-    # salva winners per /annuncio
     STATE["last_winner_ids"] = winners[:] if winners else []
     STATE["last_winner_id"] = winners[0] if winners else None
     save_state()
@@ -1024,6 +1064,8 @@ async def slash_annuncio(inter: discord.Interaction):
     STATE["last_announce_week"] = week_key(now_tz())
     STATE["last_winner_id"] = None
     STATE["last_winner_ids"] = []
+    STATE["last_winner_prev_levels"] = {}
+    STATE["last_winner_reset_flags"] = {}
     save_state()
     await inter.followup.send("📣 Annuncio **classico** eseguito.", ephemeral=True)
 
@@ -1066,6 +1108,7 @@ async def slash_annunciospeciale(inter: discord.Interaction):
     STATE["last_announce_week"] = week_key(now_tz())
     STATE["last_winner_id"] = None
     STATE["last_winner_ids"] = []
+    STATE["last_special_prize"] = None
     save_state()
     await inter.followup.send("📣 Annuncio **SPECIALE** eseguito.", ephemeral=True)
 
