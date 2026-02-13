@@ -2,7 +2,7 @@
 # Stato persistito su GitHub Gist (nessun automatismo settimanale)
 # Edizione speciale SOLO quando usi /aperturaspeciale
 #
-# ✅ MODIFICHE APPLICATE (NUOVE):
+# ✅ MODIFICHE APPLICATE:
 # - Premio calcolato SEMPRE sul livello PRIMA della vittoria (prev level), poi aggiornamento livello.
 # - Livelli: default = Livello 1 se non esisti in STATE["wins"]
 # - Progressione CLASSICA: 1 -> 2 -> 3 -> 1 (reset immediato quando vinci da Livello 3)
@@ -19,11 +19,7 @@
 #   * il premio speciale viene "bloccato" in chiusura (non ricalcolato all'annuncio)
 # - /mostralivelli e /pubblicalivelli: mostrano solo chi è registrato in wins
 #
-# ✅ WATERMARK (NUOVO):
-# - Allego imperivm_watermark.png a ogni embed e lo imposto come immagine embed
-# - Fallback automatico: se il file non esiste/errore, invia solo embed
-#
-# ✅ COLORI EMBED LOTTERIA (NUOVO):
+# ✅ COLORI EMBED LOTTERIA:
 # - CLASSICA: cornice embed cambia colore in base all'elemento attivo:
 #   * INT = rosso, AGI = verde, CHA = blu, STR = marrone
 # - SPECIALE e comandi admin: restano GOLD
@@ -97,10 +93,6 @@ COLOR_AGI = discord.Color.from_str("#27AE60")  # verde
 COLOR_CHA = discord.Color.from_str("#2980B9")  # blu
 COLOR_STR = discord.Color.from_str("#8E5A2B")  # marrone
 
-# --- Watermark file (repo root) ---
-WATERMARK_PATH = os.getenv("WATERMARK_PATH", "imperivm_watermark.png")
-WATERMARK_FILENAME = os.path.basename(WATERMARK_PATH)
-
 # --- Gist persistence ---
 GIST_ID = os.getenv("GIST_ID") or ""
 GIST_FILENAME = os.getenv("GIST_FILENAME") or "imperivm_state.json"
@@ -135,12 +127,12 @@ DEFAULT_STATE = {
     "last_winner_id": None,
     "last_winner_ids": [],
 
-    # ✅ livello "prima della vittoria" usato per calcolare premio (per annuncio corretto)
+    # livello "prima della vittoria" usato per calcolare premio (per annuncio corretto)
     "last_winner_prev_levels": {},   # {uid: prev_level}
-    # ✅ flag reset per Strength (solo informativo in annuncio)
+    # flag reset per Strength (solo informativo in annuncio)
     "last_winner_reset_flags": {},   # {uid: bool}
 
-    # ✅ premio speciale bloccato in chiusura
+    # premio speciale bloccato in chiusura
     "last_special_prize": None,      # int (kama)
 
     # Modificatori
@@ -277,40 +269,6 @@ def remember_name(uid: int, display_name: str):
 def name_fallback(uid: int) -> str:
     return STATE.get("names", {}).get(str(uid), f"utente {uid}")
 
-# ---------- WATERMARK SENDERS ----------
-
-def _attach_watermark(embed: discord.Embed) -> Tuple[discord.Embed, Optional[discord.File]]:
-    """
-    Ritorna (embed, file) pronto per send.
-    Se watermark mancante/errore -> (embed, None).
-    """
-    try:
-        if WATERMARK_PATH and os.path.exists(WATERMARK_PATH):
-            f = discord.File(WATERMARK_PATH, filename=WATERMARK_FILENAME)
-            embed.set_image(url=f"attachment://{WATERMARK_FILENAME}")
-            return embed, f
-    except Exception as e:
-        print("Errore watermark:", e)
-    return embed, None
-
-async def send_imperial(channel: discord.abc.Messageable, embed: discord.Embed):
-    """
-    Invia embed con watermark allegato (se disponibile).
-    """
-    embed, f = _attach_watermark(embed)
-    if f:
-        return await channel.send(embed=embed, file=f)
-    return await channel.send(embed=embed)
-
-async def followup_send_imperial(inter: discord.Interaction, embed: discord.Embed, ephemeral: bool = False):
-    """
-    Invia embed con watermark in followup.
-    """
-    embed, f = _attach_watermark(embed)
-    if f:
-        return await inter.followup.send(embed=embed, file=f, ephemeral=ephemeral)
-    return await inter.followup.send(embed=embed, ephemeral=ephemeral)
-
 # ---------- Modificatori settimanali (SOLO CLASSICA) ----------
 
 MOD_INT = "INT"
@@ -327,9 +285,7 @@ def modifier_label(mod: Optional[str]) -> str:
     }.get(mod or "", "NESSUNO")
 
 def lottery_color_for_modifier(mod: Optional[str]) -> discord.Color:
-    """
-    Colore cornice embed per la LOTTERIA CLASSICA.
-    """
+    """Colore cornice embed per la LOTTERIA CLASSICA."""
     if mod == MOD_INT:
         return COLOR_INT
     if mod == MOD_AGI:
@@ -395,27 +351,15 @@ def get_effective_modifier_for_open() -> str:
 # ---------- Livelli (LOGICA CORRETTA) ----------
 
 def get_level(uid: str) -> int:
-    """
-    Livello attuale:
-    - se non esiste in wins => 1
-    - se esiste => clamp 1..3
-    """
+    """Livello attuale: se non esiste in wins => 1, altrimenti clamp 1..3."""
     try:
         v = int(STATE.get("wins", {}).get(uid, 1))
     except Exception:
         v = 1
-    if v < 1:
-        v = 1
-    if v > 3:
-        v = 3
-    return v
+    return max(1, min(3, v))
 
 def set_level(uid: str, lvl: int):
-    lvl = int(lvl)
-    if lvl < 1:
-        lvl = 1
-    if lvl > 3:
-        lvl = 3
+    lvl = max(1, min(3, int(lvl)))
     STATE.setdefault("wins", {})
     STATE["wins"][uid] = lvl
 
@@ -434,29 +378,18 @@ def base_prize_text_for_level(lvl: int) -> str:
     return "500.000 Kama *(reset a Livello 1)*"
 
 def advance_level_after_classic_win(uid: str, prev_lvl: int) -> Tuple[int, bool]:
-    """
-    Dopo aver pagato il premio sul prev_lvl:
-    1->2, 2->3, 3->1 (cycle reset su 3->1)
-    Ritorna (new_lvl, did_cycle_reset)
-    """
+    """Dopo aver pagato il premio sul prev_lvl: 1->2, 2->3, 3->1 (cycle reset su 3->1)."""
     if prev_lvl == 1:
-        new = 2
-        cycle = False
+        new, cycle = 2, False
     elif prev_lvl == 2:
-        new = 3
-        cycle = False
+        new, cycle = 3, False
     else:
-        new = 1
-        cycle = True
+        new, cycle = 1, True
     set_level(uid, new)
     return new, cycle
 
 def apply_classic_win_after_prize(uid: str, prev_lvl: int):
-    """
-    CLASSICA (normale/int/agi/chance):
-    - premio calcolato su prev_lvl (gestito in annuncio)
-    - qui aggiorniamo SOLO lo stato post-vittoria
-    """
+    """CLASSICA: aggiorna SOLO lo stato post-vittoria (premio calcolato su prev_lvl)."""
     _, cycle = advance_level_after_classic_win(uid, prev_lvl)
 
     STATE.setdefault("victories", {})
@@ -474,7 +407,6 @@ def apply_strength_win_after_prize(uid: str, prev_lvl: int) -> Tuple[int, bool]:
     - premio x2 calcolato su prev_lvl (gestito in annuncio)
     - livello non avanza per L1/L2
     - se prev_lvl == 3 => reset a L1
-    Ritorna (new_lvl, did_reset)
     """
     did_reset = False
     if prev_lvl == 3:
@@ -549,14 +481,9 @@ async def post_open_message(channel: discord.TextChannel, special: bool):
         STATE["active_modifier"] = mod
         save_state()
         lines = _classic_open_lines(edition, mod)
-        embed = imperial_embed(
-            "LOTTERIA IMPERIVM – APERTA",
-            "\n".join(lines),
-            color=lottery_color_for_modifier(mod),
-        )
+        embed = imperial_embed("LOTTERIA IMPERIVM – APERTA", "\n".join(lines), color=lottery_color_for_modifier(mod))
 
-    msg = await send_imperial(channel, embed)
-
+    msg = await channel.send(embed=embed)
     STATE["open_message_id"] = msg.id
     save_state()
     print(f"[LOTTERY] Apertura {'SPECIALE' if special else 'classica'} inviata (edizione {edition})")
@@ -572,7 +499,7 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
         if not special:
             mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
             color = lottery_color_for_modifier(mod)
-        await send_imperial(channel, imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=color))
+        await channel.send(embed=imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=color))
         return
 
     desc = (
@@ -584,16 +511,13 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
 
     if special:
         desc += "🕗 **Annuncio del vincitore alle 08:00 di giovedì**."
-        await send_imperial(channel, imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=GOLD))
+        await channel.send(embed=imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=GOLD))
         return
 
     mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
     desc += f"⚙️ Modificatore attivo: **{modifier_label(mod)}**\n\n"
     desc += "🕗 **Annuncio del vincitore alle 08:00 di giovedì**."
-    await send_imperial(
-        channel,
-        imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=lottery_color_for_modifier(mod)),
-    )
+    await channel.send(embed=imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=lottery_color_for_modifier(mod)))
 
 def _special_compute_prize() -> int:
     return random.choice([600_000, 800_000, 1_000_000])
@@ -614,7 +538,7 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
             "i sigilli sono stati spezzati… ma nessun nome è stato scelto.\n"
             "Riproveremo mercoledì prossimo. 🕯️"
         )
-        await send_imperial(channel, imperial_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc, color=color))
+        await channel.send(embed=imperial_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc, color=color))
         return
 
     async def send_one(idx: int, uid_int: int):
@@ -628,8 +552,7 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
             mention = f"@{name_fallback(uid_int)}"
 
         prev_lvl = int(prev_levels.get(uid, 1))
-        if prev_lvl < 1: prev_lvl = 1
-        if prev_lvl > 3: prev_lvl = 3
+        prev_lvl = max(1, min(3, prev_lvl))
 
         lvl_now = get_level(uid)
 
@@ -660,7 +583,7 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
                 f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
                 "(+30% già applicato)"
             )
-            await send_imperial(channel, imperial_embed(title, header + body, color=color))
+            await channel.send(embed=imperial_embed(title, header + body, color=color))
             return
 
         if mod == MOD_AGI:
@@ -669,7 +592,7 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
                 "Bonus probabilità livello più basso applicato\n\n"
                 f"💰 **Ricompensa:** {base_txt}"
             )
-            await send_imperial(channel, imperial_embed(title, header + body, color=color))
+            await channel.send(embed=imperial_embed(title, header + body, color=color))
             return
 
         if mod == MOD_CHA and len(ids) == 2:
@@ -677,7 +600,7 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
                 "🍀 **Elemento Chance attivo**\n\n"
                 f"💰 **Ricompensa:** {base_txt}"
             )
-            await send_imperial(channel, imperial_embed(title, header + body, color=color))
+            await channel.send(embed=imperial_embed(title, header + body, color=color))
             return
 
         if mod == MOD_STR:
@@ -689,10 +612,10 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
                 f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
                 f"📌 {extra}"
             )
-            await send_imperial(channel, imperial_embed(title, header + body, color=color))
+            await channel.send(embed=imperial_embed(title, header + body, color=color))
             return
 
-        await send_imperial(channel, imperial_embed(title, header + f"💰 **Ricompensa:** {base_txt}", color=color))
+        await channel.send(embed=imperial_embed(title, header + f"💰 **Ricompensa:** {base_txt}", color=color))
 
     if mod == MOD_CHA and len(ids) == 2:
         await send_one(1, ids[0])
@@ -707,7 +630,7 @@ async def post_winner_announcement_special(channel: discord.TextChannel, guild: 
             "I sigilli sono stati spezzati, ma stavolta il fato è rimasto muto.\n"
             "Nessun nome scolpito negli annali: riproveremo mercoledì prossimo. 🕯️"
         )
-        await send_imperial(channel, imperial_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc, color=GOLD))
+        await channel.send(embed=imperial_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc, color=GOLD))
         return
 
     member = guild.get_member(winner_id)
@@ -733,7 +656,7 @@ async def post_winner_announcement_special(channel: discord.TextChannel, guild: 
         "Questa edizione **non modifica** i livelli.\n"
         "Che la fortuna continui a sorriderti."
     )
-    await send_imperial(channel, imperial_embed("ESTRAZIONE UFFICIALE – EDIZIONE SPECIALE", desc, color=GOLD))
+    await channel.send(embed=imperial_embed("ESTRAZIONE UFFICIALE – EDIZIONE SPECIALE", desc, color=GOLD))
 
 # ---------- Partecipanti ----------
 
@@ -766,9 +689,7 @@ def _time_weight_from_last_win(uid: str) -> float:
 
 def _agility_bonus_factor(uid: str, min_level: int) -> float:
     lvl = get_level(uid)
-    if lvl == min_level:
-        return 1.5
-    return 1.0
+    return 1.5 if lvl == min_level else 1.0
 
 def weighted_pick(participants: List[int], mod: Optional[str]) -> int:
     if not participants:
@@ -989,15 +910,13 @@ async def slash_mostralivelli(inter: discord.Interaction):
     lines = []
     for uid, lvl in items:
         uid_int = int(uid)
-        lvl_int = int(lvl)
+        lvl_int = max(1, min(3, int(lvl)))
         member = inter.guild.get_member(uid_int)
         if member:
             remember_name(uid_int, member.display_name)
             name = member.display_name
         else:
             name = name_fallback(uid_int)
-        if lvl_int < 1: lvl_int = 1
-        if lvl_int > 3: lvl_int = 3
         lines.append(f"• **{name}** — Livello: **{lvl_int}**")
 
     PAGE_SIZE = 20
@@ -1008,7 +927,7 @@ async def slash_mostralivelli(inter: discord.Interaction):
             "\n".join(page),
             color=GOLD
         )
-        await followup_send_imperial(inter, embed, ephemeral=True)
+        await inter.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="pubblicalivelli", description="Pubblica nel canale lotteria la classifica livelli (solo admin).")
 @admin_only_command()
@@ -1035,15 +954,13 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
     MAX_PUBLIC = 30
     for uid, lvl in items[:MAX_PUBLIC]:
         uid_int = int(uid)
-        lvl_int = int(lvl)
+        lvl_int = max(1, min(3, int(lvl)))
         member = inter.guild.get_member(uid_int)
         if member:
             remember_name(uid_int, member.display_name)
             name = member.display_name
         else:
             name = name_fallback(uid_int)
-        if lvl_int < 1: lvl_int = 1
-        if lvl_int > 3: lvl_int = 3
         lines.append(f"• **{name}** — Livello **{lvl_int}**")
 
     more = max(0, len(items) - MAX_PUBLIC)
@@ -1052,7 +969,7 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
         desc += f"\n\n…e altri **{more}**."
 
     embed = imperial_embed("ALBO IMPERIALE — LIVELLI", desc, color=GOLD)
-    await send_imperial(ch, embed)
+    await ch.send(embed=embed)
     save_state()
     await inter.followup.send("✅ Classifica pubblicata nel canale lotteria.", ephemeral=True)
 
