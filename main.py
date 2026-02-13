@@ -1,7 +1,21 @@
 # === IMPERIVM Lottery Bot — main.py (Render / discord.py 2.x) ===
 # Stato persistito su GitHub Gist (nessun automatismo settimanale)
 # Edizione speciale SOLO quando usi /aperturaspeciale
-# Premi speciali: 600k / 800k / 1M (+200k se il vincitore ha già vinto in passato).
+#
+# ✅ MODIFICHE APPLICATE (NUOVE):
+# - Progressione livelli corretta:
+#   * default = Livello 1 (se non esisti in STATE["wins"])
+#   * se vinci: 1 -> 2 -> 3 -> 1 (reset immediato quando vinci da Livello 3)
+# - Premio Livello 2 = SOLO 250.000 Kama (niente scudo)
+# - Elemento STRENGTH:
+#   * premio x2 calcolato sul LIVELLO ATTUALE (non sul "prossimo")
+#   * livello NON avanza, MA se vinci da Livello 3 resetti comunque a Livello 1 (coerenza/anti-exploit)
+#   * aggiorna last_win_iso sempre
+# - Edizione SPECIALE:
+#   * premio casuale 600k/800k/1M, NESSUN bonus fedeltà
+#   * NON cambia livelli / vittorie / cicli
+#   * aggiorna last_win_iso (per sorte truccata)
+# - /mostralivelli e /pubblicalivelli: mostrano solo chi è registrato in wins (come prima)
 
 import os
 import json
@@ -82,27 +96,34 @@ STATE: Dict = {}
 
 DEFAULT_STATE = {
     "schema": "imperivm.lottery.v1",
-    # ATTENZIONE: edition = PROSSIMA edizione da aprire
     "edition": 1,
-    "open_message_id": None,     # id messaggio di apertura (solo cache)
-    "wins": {},                  # {uid: 1..3}, reset a 1 dopo 3
-    "victories": {},             # {uid: tot vittorie storiche}
-    "cycles": {},                # {uid: volte raggiunto L3 (reset)}
-    "last_win_iso": {},          # {uid: ISO timestamp ultima vittoria}
-    "last_winner_id": None,      # compat: ultimo vincitore scelto (classica/speciale singola)
-    "last_winner_ids": [],       # lista vincitori (Chance -> 2)
+    "open_message_id": None,
+
+    # Livelli: salviamo il LIVELLO (1..3). Se mancante => default = 1.
+    "wins": {},
+
+    # Statistiche (solo CLASSICA, non speciale)
+    "victories": {},
+    "cycles": {},
+
+    # Per sorte truccata (aggiornato anche da Strength e Speciale)
+    "last_win_iso": {},
+
+    "last_winner_id": None,
+    "last_winner_ids": [],
 
     # Modificatori
-    "weekly_modifier": None,      # "INT"|"CHA"|"AGI"|"STR" per CLASSICA
-    "weekly_modifier_week": None, # week_key quando è stato scelto il modificatore
+    "weekly_modifier": None,
+    "weekly_modifier_week": None,
 
-    # NUOVO: override test (non cambia la casualità settimanale, è solo forzatura manuale)
-    "test_override_modifier": None,   # "INT"|"CHA"|"AGI"|"STR"|None
-    # NUOVO: modificatore effettivamente usato nell'ultima apertura classica (serve per coerenza close/announce)
-    "active_modifier": None,          # "INT"|"CHA"|"AGI"|"STR"|None
+    # Override test
+    "test_override_modifier": None,
+
+    # Modificatore effettivamente usato nell'ultima apertura classica
+    "active_modifier": None,
 
     # Cache nomi
-    "names": {},                 # {uid: ultimo display_name visto} fallback per bug ID
+    "names": {},
 
     # compat
     "last_open_week": None,
@@ -113,7 +134,6 @@ DEFAULT_STATE = {
 # ---------- Helpers Gist ----------
 
 def load_state_from_gist() -> Dict:
-    """Legge lo stato dal Gist. Se non esiste/errore, restituisce DEFAULT_STATE."""
     if not GIST_ID:
         return DEFAULT_STATE.copy()
     try:
@@ -128,21 +148,29 @@ def load_state_from_gist() -> Dict:
         if not content:
             return DEFAULT_STATE.copy()
         parsed = json.loads(content)
-        # merge chiavi mancanti
         for k, v in DEFAULT_STATE.items():
             if k not in parsed:
                 parsed[k] = v
+
         # normalizza tipi
         if not isinstance(parsed.get("last_winner_ids"), list):
             parsed["last_winner_ids"] = []
         if not isinstance(parsed.get("names"), dict):
             parsed["names"] = {}
+        if not isinstance(parsed.get("wins"), dict):
+            parsed["wins"] = {}
+        if not isinstance(parsed.get("victories"), dict):
+            parsed["victories"] = {}
+        if not isinstance(parsed.get("cycles"), dict):
+            parsed["cycles"] = {}
+        if not isinstance(parsed.get("last_win_iso"), dict):
+            parsed["last_win_iso"] = {}
+
         return parsed
     except Exception:
         return DEFAULT_STATE.copy()
 
 def save_state_to_gist(state: Dict):
-    """Scrive lo stato nel file del Gist."""
     if not GIST_ID:
         return
     payload = json.dumps({
@@ -172,17 +200,9 @@ def save_state():
     save_state_to_gist(STATE)
 
 # ---------- Bot ----------
-
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ---------- Utility ----------
-
-def is_admin(ctx_or_member) -> bool:
-    m = ctx_or_member.author if hasattr(ctx_or_member, "author") else ctx_or_member
-    if ADMIN_IDS and m.id in ADMIN_IDS:
-        return True
-    perms = getattr(m, "guild_permissions", None)
-    return bool(perms and perms.administrator)
 
 def _slash_admin_guard(inter: discord.Interaction) -> bool:
     if ADMIN_IDS and inter.user.id in ADMIN_IDS:
@@ -196,11 +216,6 @@ async def get_lottery_channel(guild: discord.Guild) -> Optional[discord.TextChan
         if isinstance(ch, discord.TextChannel):
             return ch
     return guild.text_channels[0] if guild.text_channels else None
-
-def level_from_wins(wins: int) -> int:
-    if wins <= 0:
-        return 0
-    return min(wins, 3)
 
 def golden_embed(title: str, desc: str) -> discord.Embed:
     nice_title = "📜  " + title + "  📜"
@@ -226,6 +241,117 @@ def remember_name(uid: int, display_name: str):
 
 def name_fallback(uid: int) -> str:
     return STATE.get("names", {}).get(str(uid), f"utente {uid}")
+
+# ---------- Livelli (NUOVA LOGICA) ----------
+
+def get_level(uid: str) -> int:
+    """
+    Livello attuale:
+    - se non esiste in wins => 1
+    - se esiste => clamp 1..3
+    """
+    try:
+        v = int(STATE.get("wins", {}).get(uid, 1))
+    except Exception:
+        v = 1
+    if v < 1:
+        v = 1
+    if v > 3:
+        v = 3
+    return v
+
+def set_level(uid: str, lvl: int):
+    lvl = int(lvl)
+    if lvl < 1:
+        lvl = 1
+    if lvl > 3:
+        lvl = 3
+    STATE.setdefault("wins", {})
+    STATE["wins"][uid] = lvl
+
+def base_prize_amount_for_level(lvl: int) -> int:
+    if lvl == 1:
+        return 100_000
+    if lvl == 2:
+        return 250_000
+    return 500_000
+
+def base_prize_text_for_level(lvl: int) -> str:
+    if lvl == 1:
+        return "100.000 Kama"
+    if lvl == 2:
+        return "250.000 Kama"
+    return "500.000 Kama *(reset a Livello 1)*"
+
+def advance_level_on_win(uid: str) -> Tuple[int, int, bool]:
+    """
+    Progressione: 1->2->3->1.
+    Ritorna (prev_lvl, new_lvl, did_cycle_reset)
+    """
+    prev = get_level(uid)
+    if prev == 1:
+        new = 2
+        cycle = False
+    elif prev == 2:
+        new = 3
+        cycle = False
+    else:
+        new = 1
+        cycle = True
+    set_level(uid, new)
+    return prev, new, cycle
+
+def apply_classic_win(uid: str):
+    """
+    CLASSICA (normale/int/agi/chance):
+    - avanza livello con regola 1->2->3->1
+    - incrementa victories
+    - incrementa cycles solo se 3->1
+    - aggiorna last_win_iso
+    """
+    prev, new, cycle = advance_level_on_win(uid)
+    STATE.setdefault("victories", {})
+    STATE.setdefault("cycles", {})
+    STATE.setdefault("last_win_iso", {})
+
+    STATE["victories"][uid] = int(STATE["victories"].get(uid, 0)) + 1
+    if cycle:
+        STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
+    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
+
+def apply_strength_win(uid: str) -> Tuple[int, int, bool]:
+    """
+    STRENGTH:
+    - premio x2 sul livello attuale
+    - livello non avanza
+    - MA se livello 3 => reset a livello 1 (coerenza)
+    - incrementa victories
+    - incrementa cycles se 3->1
+    - aggiorna last_win_iso
+    Ritorna (prev_lvl, new_lvl, did_reset)
+    """
+    prev = get_level(uid)
+    did_reset = False
+    if prev == 3:
+        set_level(uid, 1)
+        did_reset = True
+        new = 1
+    else:
+        new = prev
+
+    STATE.setdefault("victories", {})
+    STATE.setdefault("cycles", {})
+    STATE.setdefault("last_win_iso", {})
+
+    STATE["victories"][uid] = int(STATE["victories"].get(uid, 0)) + 1
+    if did_reset:
+        STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
+    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
+    return prev, new, did_reset
+
+def update_last_win_iso_only(uid: str):
+    STATE.setdefault("last_win_iso", {})
+    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
 
 # ---------- Modificatori settimanali (SOLO CLASSICA) ----------
 
@@ -262,7 +388,8 @@ def modifier_open_block(mod: str) -> List[str]:
     if mod == MOD_STR:
         return [
             "💪 **MODIFICATORE ATTIVO — ELEMENTO STRENGTH**",
-            "Premio raddoppiato — nessun avanzamento di livello",
+            "Premio raddoppiato — livello non avanza",
+            "Se vinci da Livello 3 → reset immediato a Livello 1",
         ]
     return ["⚙️ **MODIFICATORE ATTIVO:** NESSUNO"]
 
@@ -280,7 +407,6 @@ def pick_weekly_modifier() -> str:
     return random.choices(population, weights=weights, k=1)[0]
 
 def ensure_weekly_modifier():
-    """Assicura che per questa settimana ISO ci sia un modificatore classico scelto (CASUALE)."""
     wk = week_key(now_tz())
     if STATE.get("weekly_modifier_week") != wk or STATE.get("weekly_modifier") not in {MOD_INT, MOD_CHA, MOD_AGI, MOD_STR}:
         STATE["weekly_modifier"] = pick_weekly_modifier()
@@ -288,11 +414,6 @@ def ensure_weekly_modifier():
         save_state()
 
 def get_effective_modifier_for_open() -> str:
-    """
-    Ritorna il modificatore da usare in apertura:
-    - Se c'è test_override => usa quello
-    - Altrimenti => usa weekly casuale
-    """
     override = STATE.get("test_override_modifier")
     if override in {MOD_INT, MOD_CHA, MOD_AGI, MOD_STR}:
         return override
@@ -310,8 +431,8 @@ def _classic_open_lines(edition: int, mod: str) -> List[str]:
         "",
         "⚔️ Premi base per livello:",
         "1️⃣ Livello 1 → 100.000 Kama",
-        "2️⃣ Livello 2 → Scudo di Gilda / 250.000 Kama",
-        "3️⃣ Livello 3 → 500.000 Kama *(reset livelli)*",
+        "2️⃣ Livello 2 → 250.000 Kama",
+        "3️⃣ Livello 3 → 500.000 Kama *(reset a Livello 1)*",
         "",
     ]
     base += modifier_open_block(mod)
@@ -332,7 +453,6 @@ def _special_open_lines(edition: int) -> List[str]:
         "Reagite con ✅ a questo messaggio per partecipare.",
         "",
         "💎 **Borsa dei Premi Speciale (casuali):** 600.000 / 800.000 / 1.000.000 Kama",
-        "✨ **Bonus Fedeltà:** se hai già vinto in passato → **+200.000 Kama** al premio estratto.",
         "",
         f"**Edizione n°{edition} (SPECIALE)**",
         "",
@@ -346,7 +466,7 @@ async def post_open_message(channel: discord.TextChannel, special: bool):
         lines = _special_open_lines(edition)
     else:
         mod = get_effective_modifier_for_open()
-        STATE["active_modifier"] = mod  # salva quello effettivo usato
+        STATE["active_modifier"] = mod
         save_state()
         lines = _classic_open_lines(edition, mod)
 
@@ -377,38 +497,10 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
 
     await channel.send(embed=golden_embed("LOTTERIA IMPERIVM – CHIUSA", desc))
 
-def _classic_prize_amount(lvl: int) -> int:
-    if lvl == 1:
-        return 100_000
-    elif lvl == 2:
-        return 250_000
-    else:
-        return 500_000
+def _special_compute_prize() -> int:
+    return random.choice([600_000, 800_000, 1_000_000])
 
-def _classic_prize_text(lvl: int) -> str:
-    if lvl == 1:
-        return "100.000 Kama"
-    elif lvl == 2:
-        return "Scudo di Gilda *(se già posseduto → 250.000 Kama)*"
-    else:
-        return "500.000 Kama *(reset dei livelli)*"
-
-def _special_compute_prize(uid_str: str) -> str:
-    base = random.choice([600_000, 800_000, 1_000_000])
-    bonus = 200_000 if STATE.get("victories", {}).get(uid_str, 0) > 0 else 0
-    total = base + bonus
-    parts = [fmt_kama(total)]
-    if bonus:
-        parts.append("(+200k bonus fedeltà)")
-    return " ".join(parts)
-
-def _preview_next_wins(prev_wins: int) -> Tuple[int, bool]:
-    new = prev_wins + 1
-    reset = False
-    if new > 3:
-        new = 1
-        reset = True
-    return new, reset
+# ---------- Annunci ----------
 
 async def post_winner_announcement_classic(channel: discord.TextChannel, guild: discord.Guild):
     ids: List[int] = STATE.get("last_winner_ids") or []
@@ -423,96 +515,80 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
         await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc))
         return
 
-    async def send_one(idx: int, uid: int):
-        member = guild.get_member(uid)
+    async def send_one(idx: int, uid_int: int):
+        uid = str(uid_int)
+
+        member = guild.get_member(uid_int)
         if member:
-            remember_name(uid, member.display_name)
+            remember_name(uid_int, member.display_name)
             mention = member.mention
         else:
-            mention = f"@{name_fallback(uid)}"
+            mention = f"@{name_fallback(uid_int)}"
 
-        prev_wins = int(STATE.get("wins", {}).get(str(uid), 0))
+        # livello attuale (dopo chiusura, quindi già applicato allo stato)
+        lvl_now = get_level(uid)
 
-        if mod == MOD_STR:
-            shown_lvl = level_from_wins(prev_wins)
-            shown_state = f"{shown_lvl}/3" if shown_lvl else "0/3"
-
-            hypo_wins, _ = _preview_next_wins(prev_wins)
-            hypo_lvl = level_from_wins(hypo_wins)
-
-            base_amt = _classic_prize_amount(hypo_lvl)
-            final_amt = base_amt * 2
-
-            extra_block = (
-                "💪 **Elemento Strength attivo**\n\n"
-                f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
-                "Premio raddoppiato — livello **NON incrementato**"
+        # Header base
+        if mod == MOD_CHA and len(ids) == 2:
+            title = f"ESTRAZIONE {'I' if idx == 1 else 'II'} – LOTTERIA IMPERIVM"
+            header = (
+                f"👑 **Vincitore {'I' if idx == 1 else 'II'}:** {mention}\n"
+                f"🎖️ **Livello attuale:** {lvl_now}\n\n"
             )
+        else:
             title = "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM"
             header = (
                 "Cittadini dell’Impero,\n"
                 "i sigilli sono stati spezzati e il Fato ha pronunciato il suo verdetto.\n\n"
                 f"👑 **Vincitore:** {mention}\n"
-                f"🎖️ **Livello attuale:** {shown_lvl}\n"
-                f"📊 **Stato progressione:** {shown_state}\n\n"
-            )
-            await channel.send(embed=golden_embed(title, header + extra_block))
-            return
-
-        curr_wins = int(STATE.get("wins", {}).get(str(uid), 0))
-        lvl = level_from_wins(curr_wins)
-        stato = f"{lvl}/3" if lvl else "0/3"
-        title = "ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM"
-
-        header = (
-            "Cittadini dell’Impero,\n"
-            "i sigilli sono stati spezzati e il Fato ha pronunciato il suo verdetto.\n\n"
-        )
-
-        if mod == MOD_CHA and len(ids) == 2:
-            title = f"ESTRAZIONE {'I' if idx == 1 else 'II'} – LOTTERIA IMPERIVM"
-            header = (
-                f"👑 **Vincitore {'I' if idx == 1 else 'II'}:** {mention}\n"
-                f"🎖️ **Livello:** {lvl}\n"
-            )
-        else:
-            header += (
-                f"👑 **Vincitore:** {mention}\n"
-                f"🎖️ **Livello attuale:** {lvl}\n"
-                f"📊 **Stato progressione:** {stato}\n\n"
+                f"🎖️ **Livello attuale:** {lvl_now}\n\n"
             )
 
-        base_text = _classic_prize_text(lvl)
-        base_amt = _classic_prize_amount(lvl)
+        # premio base in funzione del livello "che ha ora"
+        base_amt = base_prize_amount_for_level(lvl_now)
+        base_txt = base_prize_text_for_level(lvl_now)
 
+        # blocchi per mod
         if mod == MOD_INT:
             final_amt = int(round(base_amt * 1.30))
-            extra_block = (
+            body = (
                 "🧠 **Elemento Intelligence attivo**\n\n"
                 f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
                 "(+30% già applicato)"
             )
-            await channel.send(embed=golden_embed(title, header + extra_block))
+            await channel.send(embed=golden_embed(title, header + body))
             return
 
         if mod == MOD_AGI:
-            extra_block = (
+            body = (
                 "🌪️ **Elemento Agility attivo**\n"
                 "Bonus probabilità livello più basso applicato\n\n"
-                f"💰 **Ricompensa:** {base_text}"
+                f"💰 **Ricompensa:** {base_txt}"
             )
-            await channel.send(embed=golden_embed(title, header + extra_block))
+            await channel.send(embed=golden_embed(title, header + body))
             return
 
         if mod == MOD_CHA and len(ids) == 2:
-            extra_block = (
+            body = (
                 "🍀 **Elemento Chance attivo**\n\n"
-                f"💰 **Ricompensa:** {base_text}"
+                f"💰 **Ricompensa:** {base_txt}"
             )
-            await channel.send(embed=golden_embed(title, header + extra_block))
+            await channel.send(embed=golden_embed(title, header + body))
             return
 
-        await channel.send(embed=golden_embed(title, header + f"💰 **Ricompensa:** {base_text}"))
+        if mod == MOD_STR:
+            # Nota: per Strength il livello non avanza, ma se era 3 è stato resettato in chiusura.
+            # Qui il livello "attuale" è già quello finale.
+            final_amt = base_amt * 2
+            body = (
+                "💪 **Elemento Strength attivo**\n\n"
+                f"💰 **Ricompensa finale: {fmt_kama(final_amt)}**\n"
+                "Premio raddoppiato — livello non avanza (se eri Livello 3 → reset a Livello 1)"
+            )
+            await channel.send(embed=golden_embed(title, header + body))
+            return
+
+        await channel.send(embed=golden_embed(title, header + f"💰 **Ricompensa:** {base_txt}"))
 
     if mod == MOD_CHA and len(ids) == 2:
         await send_one(1, ids[0])
@@ -521,8 +597,8 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
 
     await send_one(1, ids[0])
 
-async def post_winner_announcement_special(channel: discord.TextChannel, member: Optional[discord.Member]):
-    if member is None:
+async def post_winner_announcement_special(channel: discord.TextChannel, guild: discord.Guild, winner_id: Optional[int]):
+    if not winner_id:
         desc = (
             "I sigilli sono stati spezzati, ma stavolta il fato è rimasto muto.\n"
             "Nessun nome scolpito negli annali: riproveremo mercoledì prossimo. 🕯️"
@@ -530,23 +606,27 @@ async def post_winner_announcement_special(channel: discord.TextChannel, member:
         await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – LOTTERIA IMPERIVM", desc))
         return
 
-    uid = str(member.id)
-    remember_name(member.id, member.display_name)
-    lvl = level_from_wins(int(STATE["wins"].get(uid, 0)))
-    stato = f"{lvl}/3" if lvl else "0/3"
+    member = guild.get_member(winner_id)
+    if member:
+        remember_name(winner_id, member.display_name)
+        mention = member.mention
+    else:
+        mention = f"@{name_fallback(winner_id)}"
 
-    premio = _special_compute_prize(uid)
-    title = "ESTRAZIONE UFFICIALE – EDIZIONE SPECIALE"
+    premio = _special_compute_prize()
+    lvl = get_level(str(winner_id))  # solo informativo, non viene alterato
     desc = (
         "Cittadini dell’Impero, il sigillo dorato è stato infranto.\n"
         "Tra pergamene e ceralacca, il nome inciso negli annali è stato scelto.\n\n"
-        f"👑 **Vincitore:** {member.mention}\n"
-        f"⚔️ **Stato livello classico:** {stato}\n"
-        f"💎 **Ricompensa Speciale:** {premio}\n\n"
-        "Che la fortuna continui a sorriderti. La prossima chiamata dell’Aquila Imperiale\n"
-        "risuonerà **mercoledì a mezzanotte**. Presentatevi senza timore."
+        f"👑 **Vincitore:** {mention}\n"
+        f"🎖️ **Livello classico (solo informativo):** {lvl}\n"
+        f"💎 **Ricompensa Speciale:** {fmt_kama(premio)}\n\n"
+        "Questa edizione **non modifica** i livelli.\n"
+        "Che la fortuna continui a sorriderti."
     )
-    await channel.send(embed=golden_embed(title, desc))
+    await channel.send(embed=golden_embed("ESTRAZIONE UFFICIALE – EDIZIONE SPECIALE", desc))
+
+# ---------- Partecipanti ----------
 
 async def collect_participants(msg: discord.Message) -> List[int]:
     ids: List[int] = []
@@ -562,14 +642,7 @@ async def collect_participants(msg: discord.Message) -> List[int]:
                     ids.append(u.id)
     return list(dict.fromkeys(ids))
 
-def _bump_win_counters(uid: str):
-    prev = int(STATE["wins"].get(uid, 0))
-    new, reset = _preview_next_wins(prev)
-    STATE["wins"][uid] = new
-    STATE["victories"][uid] = int(STATE["victories"].get(uid, 0)) + 1
-    if reset:
-        STATE["cycles"][uid] = int(STATE["cycles"].get(uid, 0)) + 1
-    STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
+# ---------- Sorte truccata / Agility weights ----------
 
 def _time_weight_from_last_win(uid: str) -> float:
     iso = STATE.get("last_win_iso", {}).get(uid)
@@ -578,12 +651,12 @@ def _time_weight_from_last_win(uid: str) -> float:
     try:
         last = datetime.fromisoformat(iso)
         delta_days = max(0.0, (now_tz() - last).total_seconds() / 86400.0)
-        return 1.0 + min(delta_days / 7.0, 2.0)
+        return 1.0 + min(delta_days / 7.0, 2.0)  # 1..3
     except Exception:
         return 1.5
 
 def _agility_bonus_factor(uid: str, min_level: int) -> float:
-    lvl = level_from_wins(int(STATE.get("wins", {}).get(uid, 0)))
+    lvl = get_level(uid)
     if lvl == min_level:
         return 1.5
     return 1.0
@@ -592,13 +665,13 @@ def weighted_pick(participants: List[int], mod: Optional[str]) -> int:
     if not participants:
         raise ValueError("participants empty")
 
+    # min livello nel pool
     min_lvl = 99
     for uid_int in participants:
         uid = str(uid_int)
-        lvl = level_from_wins(int(STATE.get("wins", {}).get(uid, 0)))
-        min_lvl = min(min_lvl, lvl)
+        min_lvl = min(min_lvl, get_level(uid))
     if min_lvl == 99:
-        min_lvl = 0
+        min_lvl = 1
 
     weights: List[float] = []
     for uid_int in participants:
@@ -610,10 +683,12 @@ def weighted_pick(participants: List[int], mod: Optional[str]) -> int:
 
     return random.choices(participants, weights=weights, k=1)[0]
 
+# ---------- Close / Pick ----------
+
 async def _close_and_pick_common(guild: discord.Guild, special: bool):
     channel = await get_lottery_channel(guild)
     if not channel:
-        return None, [], "", None
+        return None, [], "", []
 
     msg = None
     msg_id = STATE.get("open_message_id")
@@ -627,6 +702,7 @@ async def _close_and_pick_common(guild: discord.Guild, special: bool):
     if msg:
         participants = await collect_participants(msg)
 
+    # preview nomi + salva cache
     names_preview = None
     if participants:
         names = []
@@ -645,34 +721,41 @@ async def _close_and_pick_common(guild: discord.Guild, special: bool):
         names_preview = f"{header}\n{body}"
 
     winners: List[int] = []
-    mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")  # usa SEMPRE quello dell’apertura
+    mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
 
     if participants:
         if special:
+            # SPECIALE: 1 winner, NON cambia livelli/vittorie/cicli, aggiorna solo last_win_iso
             win_id = random.choice(participants)
             winners = [win_id]
-            _bump_win_counters(str(win_id))
+            update_last_win_iso_only(str(win_id))
             save_state()
         else:
+            # CLASSICA
             if mod == MOD_CHA and len(participants) >= 2:
-                first = weighted_pick(participants, mod=None)
+                first = weighted_pick(participants, mod=None)  # chance non altera pesi
                 remaining = [x for x in participants if x != first]
                 second = weighted_pick(remaining, mod=None)
                 winners = [first, second]
-                _bump_win_counters(str(first))
-                _bump_win_counters(str(second))
+
+                # entrambi: progressione normale
+                apply_classic_win(str(first))
+                apply_classic_win(str(second))
                 save_state()
             else:
                 win_id = weighted_pick(participants, mod=mod)
                 winners = [win_id]
 
                 if mod == MOD_STR:
-                    # Strength: NON incrementa livello
+                    # strength: livello non avanza, ma se era 3 resetta a 1
+                    apply_strength_win(str(win_id))
                     save_state()
                 else:
-                    _bump_win_counters(str(win_id))
+                    # normale/int/agi: progressione 1->2->3->1
+                    apply_classic_win(str(win_id))
                     save_state()
 
+    # salva winners per /annuncio
     STATE["last_winner_ids"] = winners[:] if winners else []
     STATE["last_winner_id"] = winners[0] if winners else None
     save_state()
@@ -688,13 +771,7 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False, speci
 
     if announce_now:
         if special:
-            member = None
-            if winners:
-                try:
-                    member = await guild.fetch_member(winners[0])
-                except Exception:
-                    member = guild.get_member(winners[0])
-            await post_winner_announcement_special(channel, member)
+            await post_winner_announcement_special(channel, guild, winners[0] if winners else None)
         else:
             await post_winner_announcement_classic(channel, guild)
 
@@ -735,7 +812,7 @@ def admin_only_command():
         return func
     return deco
 
-# --- TEST MODIFICATORI (NUOVI) ---
+# --- TEST MODIFICATORI ---
 
 @bot.tree.command(name="testmodificatore", description="TEST: forza il modificatore classico per le prossime aperture (solo admin).")
 @admin_only_command()
@@ -761,7 +838,7 @@ async def slash_testoff(inter: discord.Interaction):
     save_state()
     await inter.response.send_message("✅ Test disattivato. Da ora /apertura usa il modificatore **casuale settimanale**.", ephemeral=True)
 
-# --- comandi già esistenti (tutti admin-only) ---
+# --- Utility ---
 
 @bot.tree.command(name="whoami", description="Mostra il tuo ID e se sei admin.")
 @admin_only_command()
@@ -775,7 +852,9 @@ async def slash_mostraedizione(inter: discord.Interaction):
     ed = STATE.get("edition", 1)
     await inter.response.send_message(f"🧾 **Prossima edizione da aprire:** n°{ed}", ephemeral=True)
 
-@bot.tree.command(name="mostralivelli", description="Mostra i livelli/vittorie registrati (solo admin).")
+# --- Livelli (admin-only) ---
+
+@bot.tree.command(name="mostralivelli", description="Mostra i livelli registrati (solo admin).")
 @admin_only_command()
 async def slash_mostralivelli(inter: discord.Interaction):
     if not inter.guild:
@@ -792,16 +871,18 @@ async def slash_mostralivelli(inter: discord.Interaction):
     items = sorted(wins.items(), key=lambda x: (-int(x[1]), int(x[0])))
 
     lines = []
-    for uid, w in items:
+    for uid, lvl in items:
         uid_int = int(uid)
-        w_int = int(w)
+        lvl_int = int(lvl)
         member = inter.guild.get_member(uid_int)
         if member:
             remember_name(uid_int, member.display_name)
             name = member.display_name
         else:
             name = name_fallback(uid_int)
-        lines.append(f"• **{name}** — Livello: **{level_from_wins(w_int)}**")
+        if lvl_int < 1: lvl_int = 1
+        if lvl_int > 3: lvl_int = 3
+        lines.append(f"• **{name}** — Livello: **{lvl_int}**")
 
     PAGE_SIZE = 20
     pages = [lines[i:i+PAGE_SIZE] for i in range(0, len(lines), PAGE_SIZE)]
@@ -835,17 +916,18 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
 
     lines = []
     MAX_PUBLIC = 30
-    for uid, w in items[:MAX_PUBLIC]:
+    for uid, lvl in items[:MAX_PUBLIC]:
         uid_int = int(uid)
-        w_int = int(w)
+        lvl_int = int(lvl)
         member = inter.guild.get_member(uid_int)
         if member:
             remember_name(uid_int, member.display_name)
             name = member.display_name
         else:
             name = name_fallback(uid_int)
-        lvl = level_from_wins(w_int)
-        lines.append(f"• **{name}** — Livello **{lvl}**")
+        if lvl_int < 1: lvl_int = 1
+        if lvl_int > 3: lvl_int = 3
+        lines.append(f"• **{name}** — Livello **{lvl_int}**")
 
     more = max(0, len(items) - MAX_PUBLIC)
     desc = "📜 **Classifica Livelli (Top):**\n" + "\n".join(lines)
@@ -857,6 +939,8 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
     save_state()
     await inter.followup.send("✅ Classifica pubblicata nel canale lotteria.", ephemeral=True)
 
+# --- Admin gestione stato ---
+
 @bot.tree.command(name="setedition", description="Imposta manualmente il numero di edizione (solo admin).")
 @admin_only_command()
 @app_commands.describe(numero="Numero edizione da impostare (>=1). È la PROSSIMA edizione che aprirai.")
@@ -864,27 +948,11 @@ async def slash_setedition(inter: discord.Interaction, numero: int):
     if numero < 1:
         await inter.response.send_message("❌ L'edizione deve essere ≥ 1.", ephemeral=True)
         return
-    STATE["edition"] = numero
+    STATE["edition"] = int(numero)
     save_state()
     await inter.response.send_message(f"✅ Prossima edizione impostata a **{numero}**.", ephemeral=True)
 
-@bot.tree.command(name="setwin", description="Registra manualmente una vittoria e aggiorna i dati (solo admin).")
-@admin_only_command()
-@app_commands.describe(utente="Seleziona l'utente vincitore da registrare")
-async def slash_setwin(inter: discord.Interaction, utente: discord.Member):
-    uid = str(utente.id)
-    remember_name(utente.id, utente.display_name)
-    _bump_win_counters(uid)
-    save_state()
-    lvl = level_from_wins(int(STATE["wins"].get(uid, 0)))
-    tot = int(STATE["victories"].get(uid, 0))
-    cyc = int(STATE["cycles"].get(uid, 0))
-    await inter.response.send_message(
-        f"✅ Registrata vittoria per **{utente.display_name}** — Livello attuale: {lvl} • Vittorie totali: {tot} • Cicli: {cyc}",
-        ephemeral=True
-    )
-
-@bot.tree.command(name="setlivello", description="Imposta manualmente il livello (1–3) di un vincitore (solo admin).")
+@bot.tree.command(name="setlivello", description="Imposta manualmente il livello (1–3) di un utente (solo admin).")
 @admin_only_command()
 @app_commands.describe(utente="Utente di cui modificare il livello", livello="Livello da impostare (1, 2 o 3)")
 async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, livello: int):
@@ -893,10 +961,10 @@ async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, l
         return
     uid = str(utente.id)
     remember_name(utente.id, utente.display_name)
-    STATE["wins"][uid] = int(livello)
+    set_level(uid, livello)
     save_state()
-    tot = int(STATE["victories"].get(uid, 0))
-    cyc = int(STATE["cycles"].get(uid, 0))
+    tot = int(STATE.get("victories", {}).get(uid, 0))
+    cyc = int(STATE.get("cycles", {}).get(uid, 0))
     await inter.response.send_message(
         f"✅ Impostato **livello {livello}** per **{utente.display_name}** "
         f"(vittorie totali: {tot}, cicli: {cyc}).",
@@ -908,16 +976,18 @@ async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, l
 @app_commands.describe(utente="Utente da cancellare dalla memoria vincitori")
 async def slash_rimuoviwinner(inter: discord.Interaction, utente: discord.Member):
     uid = str(utente.id)
-    STATE["wins"].pop(uid, None)
-    STATE["victories"].pop(uid, None)
-    STATE["cycles"].pop(uid, None)
-    STATE["last_win_iso"].pop(uid, None)
+    STATE.get("wins", {}).pop(uid, None)
+    STATE.get("victories", {}).pop(uid, None)
+    STATE.get("cycles", {}).pop(uid, None)
+    STATE.get("last_win_iso", {}).pop(uid, None)
     STATE.get("names", {}).pop(uid, None)
     save_state()
     await inter.response.send_message(
         f"🧹 **{utente.display_name}** rimosso dalla memoria dei vincitori.",
         ephemeral=True
     )
+
+# --- Lotteria CLASSICA ---
 
 @bot.tree.command(name="apertura", description="Apre la lotteria CLASSICA (solo admin).")
 @admin_only_command()
@@ -926,6 +996,7 @@ async def slash_apertura(inter: discord.Interaction):
     ed = int(STATE.get("edition", 1))
 
     await open_lottery(inter.guild, special=False)
+
     STATE["edition"] = ed + 1
     save_state()
     await inter.followup.send(f"📜 Apertura **classica** eseguita (edizione n°{ed}).", ephemeral=True)
@@ -956,13 +1027,16 @@ async def slash_annuncio(inter: discord.Interaction):
     save_state()
     await inter.followup.send("📣 Annuncio **classico** eseguito.", ephemeral=True)
 
-# --- Speciale: comandi forzati (lasciata IDENTICA nella logica premi) ---
+# --- SPECIALE ---
+
 @bot.tree.command(name="aperturaspeciale", description="Apre la lotteria **Special Edition** (solo admin).")
 @admin_only_command()
 async def slash_aperturaspeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
     ed = int(STATE.get("edition", 1))
+
     await open_lottery(inter.guild, special=True)
+
     STATE["edition"] = ed + 1
     save_state()
     await inter.followup.send(f"💎 Apertura **SPECIALE** eseguita (edizione n°{ed}).", ephemeral=True)
@@ -986,14 +1060,8 @@ async def slash_annunciospeciale(inter: discord.Interaction):
         return
 
     lw = STATE.get("last_winner_id")
-    member = None
-    if lw:
-        try:
-            member = await inter.guild.fetch_member(int(lw))
-        except Exception:
-            member = inter.guild.get_member(int(lw))
-
-    await post_winner_announcement_special(ch, member)
+    winner_id = int(lw) if lw else None
+    await post_winner_announcement_special(ch, inter.guild, winner_id)
 
     STATE["last_announce_week"] = week_key(now_tz())
     STATE["last_winner_id"] = None
