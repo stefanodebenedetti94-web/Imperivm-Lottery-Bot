@@ -2,31 +2,17 @@
 # Stato persistito su GitHub Gist (nessun automatismo settimanale)
 # Edizione speciale SOLO quando usi /aperturaspeciale
 #
-# ✅ MODIFICHE APPLICATE:
-# - Premio calcolato SEMPRE sul livello PRIMA della vittoria (prev level), poi aggiornamento livello.
-# - Livelli: default = Livello 1 se non esisti in STATE["wins"]
-# - Progressione CLASSICA: 1 -> 2 -> 3 -> 1 (reset immediato quando vinci da Livello 3)
-# - Livello 2 = SOLO 250.000 Kama (niente scudo)
-# - STRENGTH:
-#   * premio x2 sul livello PRIMA della vittoria
-#   * livello NON avanza per L1/L2
-#   * se vinci da L3 => reset a L1 (anti-exploit)
-#   * aggiorna last_win_iso sempre
-# - SPECIALE:
-#   * premio casuale 600k/800k/1M, NESSUN bonus fedeltà
-#   * NON cambia livelli/vittorie/cicli
-#   * aggiorna last_win_iso (per sorte truccata)
-#   * il premio speciale viene "bloccato" in chiusura (non ricalcolato all'annuncio)
-# - /mostralivelli e /pubblicalivelli: mostrano solo chi è registrato in wins
-#
-# ✅ COLORI EMBED LOTTERIA:
-# - CLASSICA: cornice embed cambia colore in base all'elemento attivo:
-#   * INT = rosso, AGI = verde, CHA = blu, STR = marrone
-# - SPECIALE e comandi admin: restano GOLD
+# FIX STABILITÀ:
+# - Evitato sync globale automatico a ogni boot (causa probabile dei 429 / Cloudflare 1015)
+# - Sync slash opzionale via env: SYNC_ON_START=true/false
+# - Possibilità di sync su singola guild via env: SYNC_GUILD_ID
+# - Debounce salvataggi Gist per evitare spam di PATCH
+# - Migliorati alcuni controlli su guild/channel/message
 
 import os
 import json
 import random
+import time
 from datetime import datetime
 from threading import Thread
 from typing import Optional, List, Dict, Tuple
@@ -84,6 +70,14 @@ if _env_admins:
 
 TZ = pytz.timezone(os.getenv("TZ", "Europe/Rome"))
 
+# Sync slash:
+# IMPORTANTE: su Render conviene tenerlo FALSE per non fare sync a ogni riavvio
+SYNC_ON_START = os.getenv("SYNC_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}
+SYNC_GUILD_ID = int(os.getenv("SYNC_GUILD_ID", "0"))
+
+# Debounce salvataggi Gist
+GIST_SAVE_MIN_INTERVAL = float(os.getenv("GIST_SAVE_MIN_INTERVAL", "2.0"))
+
 # Colore default (admin/speciale)
 GOLD = discord.Color.from_str("#DAA520")
 
@@ -108,6 +102,7 @@ def _gist_headers() -> Dict[str, str]:
     return hdr
 
 STATE: Dict = {}
+_LAST_GIST_SAVE_TS = 0.0
 
 DEFAULT_STATE = {
     "schema": "imperivm.lottery.v1",
@@ -194,7 +189,8 @@ def load_state_from_gist() -> Dict:
             parsed["last_winner_reset_flags"] = {}
 
         return parsed
-    except Exception:
+    except Exception as e:
+        print("Errore load Gist:", e)
         return DEFAULT_STATE.copy()
 
 def save_state_to_gist(state: Dict):
@@ -221,9 +217,16 @@ def load_state():
     STATE = load_state_from_gist()
     if STATE.get("schema") != DEFAULT_STATE["schema"]:
         STATE["schema"] = DEFAULT_STATE["schema"]
-    save_state_to_gist(STATE)
+    save_state(force=True)
 
-def save_state():
+def save_state(force: bool = False):
+    global _LAST_GIST_SAVE_TS
+    now_mono = time.monotonic()
+
+    if not force and (now_mono - _LAST_GIST_SAVE_TS) < GIST_SAVE_MIN_INTERVAL:
+        return
+
+    _LAST_GIST_SAVE_TS = now_mono
     save_state_to_gist(STATE)
 
 # ---------- Bot ----------
@@ -237,11 +240,15 @@ def _slash_admin_guard(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and perms.administrator)
 
-async def get_lottery_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+async def get_lottery_channel(guild: Optional[discord.Guild]) -> Optional[discord.TextChannel]:
+    if guild is None:
+        return None
+
     if LOTTERY_CHANNEL_ID:
         ch = guild.get_channel(LOTTERY_CHANNEL_ID)
         if isinstance(ch, discord.TextChannel):
             return ch
+
     return guild.text_channels[0] if guild.text_channels else None
 
 def imperial_embed(title: str, desc: str, color: discord.Color = GOLD) -> discord.Embed:
@@ -285,7 +292,6 @@ def modifier_label(mod: Optional[str]) -> str:
     }.get(mod or "", "NESSUNO")
 
 def lottery_color_for_modifier(mod: Optional[str]) -> discord.Color:
-    """Colore cornice embed per la LOTTERIA CLASSICA."""
     if mod == MOD_INT:
         return COLOR_INT
     if mod == MOD_AGI:
@@ -322,14 +328,6 @@ def modifier_open_block(mod: str) -> List[str]:
     return ["⚙️ **MODIFICATORE ATTIVO:** NESSUNO"]
 
 def pick_weekly_modifier() -> str:
-    """
-    Chance più rara: -20% rispetto alle altre.
-    Pesi:
-    - INT 25
-    - AGI 25
-    - STR 25
-    - CHA 20
-    """
     population = [MOD_INT, MOD_AGI, MOD_STR, MOD_CHA]
     weights = [25, 25, 25, 20]
     return random.choices(population, weights=weights, k=1)[0]
@@ -348,10 +346,9 @@ def get_effective_modifier_for_open() -> str:
     ensure_weekly_modifier()
     return STATE["weekly_modifier"]
 
-# ---------- Livelli (LOGICA CORRETTA) ----------
+# ---------- Livelli ----------
 
 def get_level(uid: str) -> int:
-    """Livello attuale: se non esiste in wins => 1, altrimenti clamp 1..3."""
     try:
         v = int(STATE.get("wins", {}).get(uid, 1))
     except Exception:
@@ -378,7 +375,6 @@ def base_prize_text_for_level(lvl: int) -> str:
     return "500.000 Kama *(reset a Livello 1)*"
 
 def advance_level_after_classic_win(uid: str, prev_lvl: int) -> Tuple[int, bool]:
-    """Dopo aver pagato il premio sul prev_lvl: 1->2, 2->3, 3->1 (cycle reset su 3->1)."""
     if prev_lvl == 1:
         new, cycle = 2, False
     elif prev_lvl == 2:
@@ -389,7 +385,6 @@ def advance_level_after_classic_win(uid: str, prev_lvl: int) -> Tuple[int, bool]
     return new, cycle
 
 def apply_classic_win_after_prize(uid: str, prev_lvl: int):
-    """CLASSICA: aggiorna SOLO lo stato post-vittoria (premio calcolato su prev_lvl)."""
     _, cycle = advance_level_after_classic_win(uid, prev_lvl)
 
     STATE.setdefault("victories", {})
@@ -402,12 +397,6 @@ def apply_classic_win_after_prize(uid: str, prev_lvl: int):
     STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
 
 def apply_strength_win_after_prize(uid: str, prev_lvl: int) -> Tuple[int, bool]:
-    """
-    STRENGTH:
-    - premio x2 calcolato su prev_lvl (gestito in annuncio)
-    - livello non avanza per L1/L2
-    - se prev_lvl == 3 => reset a L1
-    """
     did_reset = False
     if prev_lvl == 3:
         set_level(uid, 1)
@@ -662,10 +651,6 @@ async def post_winner_announcement_special(channel: discord.TextChannel, guild: 
 
 async def collect_participants(msg: discord.Message) -> List[int]:
     ids: List[int] = []
-    try:
-        await msg.fetch()
-    except Exception:
-        pass
     for r in msg.reactions:
         if str(r.emoji) == "✅":
             users = [u async for u in r.users()]
@@ -817,10 +802,14 @@ async def close_and_pick(guild: discord.Guild, announce_now: bool = False, speci
     print(f"[LOTTERY] Chiusura eseguita ({'SPECIALE' if special else 'classica'}) (partecipanti: {len(participants)})")
     return winners[0] if winners else None
 
-async def open_lottery(guild: discord.Guild, special: bool = False):
+async def open_lottery(guild: Optional[discord.Guild], special: bool = False):
+    if guild is None:
+        return
+
     channel = await get_lottery_channel(guild)
     if not channel:
         return
+
     if STATE.get("open_message_id"):
         try:
             await channel.fetch_message(STATE["open_message_id"])
@@ -828,6 +817,7 @@ async def open_lottery(guild: discord.Guild, special: bool = False):
             return
         except Exception:
             pass
+
     await post_open_message(channel, special=special)
 
 # ---------- Eventi ----------
@@ -861,7 +851,7 @@ def admin_only_command():
 ])
 async def slash_testmodificatore(inter: discord.Interaction, elemento: app_commands.Choice[str]):
     STATE["test_override_modifier"] = elemento.value
-    save_state()
+    save_state(force=True)
     await inter.response.send_message(
         f"🧪 TEST attivo: prossimo /apertura userà **{modifier_label(elemento.value)}**.\n"
         f"Per tornare casuale: **/testoff**",
@@ -872,7 +862,7 @@ async def slash_testmodificatore(inter: discord.Interaction, elemento: app_comma
 @admin_only_command()
 async def slash_testoff(inter: discord.Interaction):
     STATE["test_override_modifier"] = None
-    save_state()
+    save_state(force=True)
     await inter.response.send_message("✅ Test disattivato. Da ora /apertura usa il modificatore **casuale settimanale**.", ephemeral=True)
 
 # --- Utility ---
@@ -983,7 +973,7 @@ async def slash_setedition(inter: discord.Interaction, numero: int):
         await inter.response.send_message("❌ L'edizione deve essere ≥ 1.", ephemeral=True)
         return
     STATE["edition"] = int(numero)
-    save_state()
+    save_state(force=True)
     await inter.response.send_message(f"✅ Prossima edizione impostata a **{numero}**.", ephemeral=True)
 
 @bot.tree.command(name="setlivello", description="Imposta manualmente il livello (1–3) di un utente (solo admin).")
@@ -996,7 +986,7 @@ async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, l
     uid = str(utente.id)
     remember_name(utente.id, utente.display_name)
     set_level(uid, livello)
-    save_state()
+    save_state(force=True)
     tot = int(STATE.get("victories", {}).get(uid, 0))
     cyc = int(STATE.get("cycles", {}).get(uid, 0))
     await inter.response.send_message(
@@ -1015,7 +1005,24 @@ async def slash_rimuoviwinner(inter: discord.Interaction, utente: discord.Member
     STATE.get("cycles", {}).pop(uid, None)
     STATE.get("last_win_iso", {}).pop(uid, None)
     STATE.get("names", {}).pop(uid, None)
-    save_state()
+    save_state(force=True)
+    await inter.response.send_message(
+        f"🧹 **{utente.display_name}** rimosso dalla memoria dei vincitori.",
+        ephemeral=True
+    )
+
+# alias richiesto
+@bot.tree.command(name="removewinner", description="Alias di /rimuoviwinner (solo admin).")
+@admin_only_command()
+@app_commands.describe(utente="Utente da cancellare dalla memoria vincitori")
+async def slash_removewinner(inter: discord.Interaction, utente: discord.Member):
+    uid = str(utente.id)
+    STATE.get("wins", {}).pop(uid, None)
+    STATE.get("victories", {}).pop(uid, None)
+    STATE.get("cycles", {}).pop(uid, None)
+    STATE.get("last_win_iso", {}).pop(uid, None)
+    STATE.get("names", {}).pop(uid, None)
+    save_state(force=True)
     await inter.response.send_message(
         f"🧹 **{utente.display_name}** rimosso dalla memoria dei vincitori.",
         ephemeral=True
@@ -1027,27 +1034,41 @@ async def slash_rimuoviwinner(inter: discord.Interaction, utente: discord.Member
 @admin_only_command()
 async def slash_apertura(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
-    ed = int(STATE.get("edition", 1))
 
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
+    ed = int(STATE.get("edition", 1))
     await open_lottery(inter.guild, special=False)
 
     STATE["edition"] = ed + 1
-    save_state()
+    save_state(force=True)
     await inter.followup.send(f"📜 Apertura **classica** eseguita (edizione n°{ed}).", ephemeral=True)
 
 @bot.tree.command(name="chiusura", description="Chiude e seleziona il vincitore (lotteria CLASSICA, solo admin).")
 @admin_only_command()
 async def slash_chiusura(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
+
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
     await close_and_pick(inter.guild, announce_now=False, special=False)
     STATE["last_close_week"] = week_key(now_tz())
-    save_state()
+    save_state(force=True)
     await inter.followup.send("🗝️ Chiusura **classica** eseguita.", ephemeral=True)
 
 @bot.tree.command(name="annuncio", description="Annuncia il vincitore (lotteria CLASSICA, solo admin).")
 @admin_only_command()
 async def slash_annuncio(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
+
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
     ch = await get_lottery_channel(inter.guild)
     if not ch:
         await inter.followup.send("⚠️ Canale lotteria non trovato.", ephemeral=True)
@@ -1060,7 +1081,7 @@ async def slash_annuncio(inter: discord.Interaction):
     STATE["last_winner_ids"] = []
     STATE["last_winner_prev_levels"] = {}
     STATE["last_winner_reset_flags"] = {}
-    save_state()
+    save_state(force=True)
     await inter.followup.send("📣 Annuncio **classico** eseguito.", ephemeral=True)
 
 # --- SPECIALE ---
@@ -1069,27 +1090,41 @@ async def slash_annuncio(inter: discord.Interaction):
 @admin_only_command()
 async def slash_aperturaspeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
-    ed = int(STATE.get("edition", 1))
 
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
+    ed = int(STATE.get("edition", 1))
     await open_lottery(inter.guild, special=True)
 
     STATE["edition"] = ed + 1
-    save_state()
+    save_state(force=True)
     await inter.followup.send(f"💎 Apertura **SPECIALE** eseguita (edizione n°{ed}).", ephemeral=True)
 
 @bot.tree.command(name="chiusuraspeciale", description="Chiude e seleziona il vincitore (EDIZIONE SPECIALE, solo admin).")
 @admin_only_command()
 async def slash_chiusuraspeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
+
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
     await close_and_pick(inter.guild, announce_now=False, special=True)
     STATE["last_close_week"] = week_key(now_tz())
-    save_state()
+    save_state(force=True)
     await inter.followup.send("🗝️ Chiusura **SPECIALE** eseguita.", ephemeral=True)
 
 @bot.tree.command(name="annunciospeciale", description="Annuncia il vincitore (EDIZIONE SPECIALE, solo admin).")
 @admin_only_command()
 async def slash_annunciospeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
+
+    if not inter.guild:
+        await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+
     ch = await get_lottery_channel(inter.guild)
     if not ch:
         await inter.followup.send("⚠️ Canale lotteria non trovato.", ephemeral=True)
@@ -1103,7 +1138,7 @@ async def slash_annunciospeciale(inter: discord.Interaction):
     STATE["last_winner_id"] = None
     STATE["last_winner_ids"] = []
     STATE["last_special_prize"] = None
-    save_state()
+    save_state(force=True)
     await inter.followup.send("📣 Annuncio **SPECIALE** eseguito.", ephemeral=True)
 
 # ---------- Avvio ----------
@@ -1111,7 +1146,17 @@ async def slash_annunciospeciale(inter: discord.Interaction):
 @bot.event
 async def setup_hook():
     try:
-        await bot.tree.sync()
+        if not SYNC_ON_START:
+            print("ℹ️ Sync slash automatico DISATTIVATO (SYNC_ON_START=false).")
+            return
+
+        if SYNC_GUILD_ID:
+            guild_obj = discord.Object(id=SYNC_GUILD_ID)
+            synced = await bot.tree.sync(guild=guild_obj)
+            print(f"✅ Slash sync su guild {SYNC_GUILD_ID}: {len(synced)} comandi.")
+        else:
+            synced = await bot.tree.sync()
+            print(f"✅ Slash sync globale: {len(synced)} comandi.")
     except Exception as e:
         print("Errore sync comandi:", e)
 
