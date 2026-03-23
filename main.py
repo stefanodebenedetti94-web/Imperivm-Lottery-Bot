@@ -2,10 +2,13 @@
 # Stato persistito su GitHub Gist
 # Lotteria classica + speciale
 # Automazione VPS:
-# - Mercoledì 00:00 apertura classica
-# - Giovedì 00:00 chiusura classica
-# - Giovedì 08:00 annuncio classico
-# Comandi test automazione inclusi
+# - Mercoledì 00:00 apertura
+# - Giovedì 00:00 chiusura
+# - Giovedì 08:00 annuncio
+# La modalità automatica segue STATE["lottery_mode"]:
+# - "classic"  -> apertura/chiusura/annuncio classici
+# - "special"  -> apertura/chiusura/annuncio speciali
+# Dopo un annuncio SPECIALE automatico, la modalità torna automaticamente a CLASSICA.
 
 import os
 import json
@@ -46,7 +49,7 @@ if _env_admins:
 
 TZ = pytz.timezone(os.getenv("TZ", "Europe/Rome"))
 
-# Sync slash opzionale
+# Sync slash opzionale (solo se vuoi forzare sync al boot)
 SYNC_ON_START = os.getenv("SYNC_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}
 SYNC_GUILD_ID = int(os.getenv("SYNC_GUILD_ID", "0"))
 
@@ -81,7 +84,7 @@ _LAST_GIST_SAVE_TS = 0.0
 TEST_TASKS: Dict[str, asyncio.Task] = {}
 
 DEFAULT_STATE = {
-    "schema": "imperivm.lottery.v1",
+    "schema": "imperivm.lottery.v2",
     "edition": 1,
     "open_message_id": None,
 
@@ -107,6 +110,10 @@ DEFAULT_STATE = {
     "last_open_week": None,
     "last_close_week": None,
     "last_announce_week": None,
+
+    # Nuove chiavi
+    "automation_enabled": True,      # True = automazione attiva
+    "lottery_mode": "classic",       # "classic" oppure "special"
 }
 
 def load_state_from_gist() -> Dict:
@@ -150,6 +157,10 @@ def load_state_from_gist() -> Dict:
         if not isinstance(parsed.get("last_winner_reset_flags"), dict):
             parsed["last_winner_reset_flags"] = {}
 
+        if parsed.get("lottery_mode") not in {"classic", "special"}:
+            parsed["lottery_mode"] = "classic"
+
+        parsed["automation_enabled"] = bool(parsed.get("automation_enabled", True))
         return parsed
 
     except Exception as e:
@@ -257,6 +268,24 @@ def clear_user_state(uid: str):
     STATE.get("last_win_iso", {}).pop(uid, None)
     STATE.get("names", {}).pop(uid, None)
 
+def mode_label(mode: Optional[str]) -> str:
+    return "SPECIALE" if mode == "special" else "CLASSICA"
+
+def automation_label() -> str:
+    return "ON" if STATE.get("automation_enabled", True) else "OFF"
+
+def get_future_effective_modifier() -> Optional[str]:
+    """Modificatore che verrebbe usato alla prossima apertura classica."""
+    if STATE.get("lottery_mode", "classic") != "classic":
+        return None
+
+    override = STATE.get("test_override_modifier")
+    if override in {MOD_INT, MOD_CHA, MOD_AGI, MOD_STR}:
+        return override
+
+    ensure_weekly_modifier()
+    return STATE.get("weekly_modifier")
+
 # ---------- Modificatori ----------
 
 MOD_INT = "INT"
@@ -270,7 +299,7 @@ def modifier_label(mod: Optional[str]) -> str:
         MOD_CHA: "ELEMENTO CHANCE",
         MOD_AGI: "ELEMENTO AGILITY",
         MOD_STR: "ELEMENTO STRENGTH",
-    }.get(mod or "", "NESSUNO")
+    }.get(mod or "", "OFF")
 
 def lottery_color_for_modifier(mod: Optional[str]) -> discord.Color:
     if mod == MOD_INT:
@@ -306,7 +335,7 @@ def modifier_open_block(mod: str) -> List[str]:
             "Premio raddoppiato — livello non avanza (L1/L2)",
             "Se vinci da Livello 3 → reset immediato a Livello 1",
         ]
-    return ["⚙️ **MODIFICATORE ATTIVO:** NESSUNO"]
+    return ["⚙️ **MODIFICATORE ATTIVO:** OFF"]
 
 def pick_weekly_modifier() -> str:
     population = [MOD_INT, MOD_AGI, MOD_STR, MOD_CHA]
@@ -433,6 +462,7 @@ def _special_open_lines(edition: int) -> List[str]:
         "",
         "Reagite con ✅ a questo messaggio per partecipare.",
         "",
+        "⚙️ **Modificatori:** OFF",
         "💎 **Borsa dei Premi Speciale (casuali):** 600.000 / 800.000 / 1.000.000 Kama",
         "",
         f"**Edizione n°{edition} (SPECIALE)**",
@@ -446,6 +476,8 @@ async def post_open_message(channel: discord.TextChannel, special: bool):
     edition = STATE["edition"]
 
     if special:
+        STATE["active_modifier"] = None
+        save_state()
         lines = _special_open_lines(edition)
         embed = imperial_embed("LOTTERIA IMPERIVM – APERTA", "\n".join(lines), color=GOLD)
     else:
@@ -479,6 +511,7 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
         desc += names_preview + "\n\n"
 
     if special:
+        desc += "⚙️ Modificatori: **OFF**\n\n"
         desc += "🕗 **Annuncio del vincitore alle 08:00 di giovedì**."
         await channel.send(embed=imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=GOLD))
         return
@@ -620,6 +653,7 @@ async def post_winner_announcement_special(channel: discord.TextChannel, guild: 
         "Tra pergamene e ceralacca, il nome inciso negli annali è stato scelto.\n\n"
         f"👑 **Vincitore:** {mention}\n"
         f"🎖️ **Livello classico (solo informativo):** {lvl}\n"
+        f"⚙️ **Modificatori:** OFF\n"
         f"💎 **Ricompensa Speciale:** {fmt_kama(premio)}\n\n"
         "Questa edizione **non modifica** i livelli.\n"
         "Che la fortuna continui a sorriderti."
@@ -713,7 +747,7 @@ async def _close_and_pick_common(guild: discord.Guild, special: bool):
         names_preview = f"{header}\n{body}"
 
     winners: List[int] = []
-    mod = STATE.get("active_modifier") or STATE.get("weekly_modifier")
+    mod = None if special else (STATE.get("active_modifier") or STATE.get("weekly_modifier"))
 
     STATE["last_winner_prev_levels"] = {}
     STATE["last_winner_reset_flags"] = {}
@@ -802,14 +836,33 @@ async def open_lottery(guild: Optional[discord.Guild], special: bool = False):
 # ---------- Automazione ----------
 
 def auto_schedule_status_lines() -> List[str]:
+    mode = STATE.get("lottery_mode", "classic")
+    if not STATE.get("automation_enabled", True):
+        return [
+            "⏰ **Automazione:** OFF",
+            f"📌 **Modalità automatica impostata:** {mode_label(mode)}",
+        ]
+
+    if mode == "special":
+        return [
+            "⏰ **Automazione:** ON",
+            "• Mercoledì 00:00 → apertura SPECIALE",
+            "• Giovedì 00:00 → chiusura SPECIALE",
+            "• Giovedì 08:00 → annuncio SPECIALE",
+            "• Dopo l'annuncio speciale → reset automatico a CLASSICA",
+        ]
+
     return [
-        "⏰ **Automazione attiva**",
-        "• Mercoledì 00:00 → apertura classica",
-        "• Giovedì 00:00 → chiusura classica",
-        "• Giovedì 08:00 → annuncio classico",
+        "⏰ **Automazione:** ON",
+        "• Mercoledì 00:00 → apertura CLASSICA",
+        "• Giovedì 00:00 → chiusura CLASSICA",
+        "• Giovedì 08:00 → annuncio CLASSICO",
     ]
 
 async def run_auto_open():
+    if not STATE.get("automation_enabled", True):
+        return
+
     guild = bot.guilds[0] if bot.guilds else None
     if guild is None:
         return
@@ -818,12 +871,20 @@ async def run_auto_open():
     if STATE.get("last_open_week") == wk:
         return
 
-    await open_lottery(guild, special=False)
+    mode = STATE.get("lottery_mode", "classic")
+    special = (mode == "special")
+
+    ed = int(STATE.get("edition", 1))
+    await open_lottery(guild, special=special)
+    STATE["edition"] = ed + 1
     STATE["last_open_week"] = wk
     save_state(force=True)
-    print(f"[AUTO] Apertura automatica eseguita per settimana {wk}")
+    print(f"[AUTO] Apertura automatica eseguita per settimana {wk} — modalità {mode_label(mode)}")
 
 async def run_auto_close():
+    if not STATE.get("automation_enabled", True):
+        return
+
     guild = bot.guilds[0] if bot.guilds else None
     if guild is None:
         return
@@ -832,12 +893,18 @@ async def run_auto_close():
     if STATE.get("last_close_week") == wk:
         return
 
-    await close_and_pick(guild, announce_now=False, special=False)
+    mode = STATE.get("lottery_mode", "classic")
+    special = (mode == "special")
+
+    await close_and_pick(guild, announce_now=False, special=special)
     STATE["last_close_week"] = wk
     save_state(force=True)
-    print(f"[AUTO] Chiusura automatica eseguita per settimana {wk}")
+    print(f"[AUTO] Chiusura automatica eseguita per settimana {wk} — modalità {mode_label(mode)}")
 
 async def run_auto_announce():
+    if not STATE.get("automation_enabled", True):
+        return
+
     guild = bot.guilds[0] if bot.guilds else None
     if guild is None:
         return
@@ -850,6 +917,25 @@ async def run_auto_announce():
     if not ch:
         return
 
+    mode = STATE.get("lottery_mode", "classic")
+    special = (mode == "special")
+
+    if special:
+        lw = STATE.get("last_winner_id")
+        winner_id = int(lw) if lw else None
+        await post_winner_announcement_special(ch, guild, winner_id)
+
+        STATE["last_announce_week"] = wk
+        STATE["last_winner_id"] = None
+        STATE["last_winner_ids"] = []
+        STATE["last_special_prize"] = None
+
+        # reset automatico a classica dopo una speciale automatica
+        STATE["lottery_mode"] = "classic"
+        save_state(force=True)
+        print(f"[AUTO] Annuncio automatico SPECIALE eseguito per settimana {wk} — reset modalità a CLASSICA")
+        return
+
     await post_winner_announcement_classic(ch, guild)
 
     STATE["last_announce_week"] = wk
@@ -858,10 +944,13 @@ async def run_auto_announce():
     STATE["last_winner_prev_levels"] = {}
     STATE["last_winner_reset_flags"] = {}
     save_state(force=True)
-    print(f"[AUTO] Annuncio automatico eseguito per settimana {wk}")
+    print(f"[AUTO] Annuncio automatico CLASSICO eseguito per settimana {wk}")
 
 @tasks.loop(minutes=1)
 async def automation_loop():
+    if not STATE.get("automation_enabled", True):
+        return
+
     now = now_tz()
     wd = now.weekday()  # lun=0 ... dom=6
     hh = now.hour
@@ -928,6 +1017,7 @@ async def on_ready():
     print(f"✅ Gist attivo: {'sì' if bool(GIST_ID) else 'no'}")
     print(f"✅ Canale lotteria ID: {LOTTERY_CHANNEL_ID or 'auto-primo-canale'}")
     print(f"✅ Admin extra caricati: {len(ADMIN_IDS)}")
+    print(f"✅ Automazione: {automation_label()} — Modalità: {mode_label(STATE.get('lottery_mode', 'classic'))}")
 
 # ---------- Comandi test modificatori ----------
 
@@ -943,7 +1033,7 @@ async def slash_testmodificatore(inter: discord.Interaction, elemento: app_comma
     STATE["test_override_modifier"] = elemento.value
     save_state(force=True)
     await inter.response.send_message(
-        f"🧪 TEST attivo: prossimo /apertura userà **{modifier_label(elemento.value)}**.\n"
+        f"🧪 TEST attivo: la prossima apertura **classica** userà **{modifier_label(elemento.value)}**.\n"
         f"Per tornare casuale: **/testoff**",
         ephemeral=True
     )
@@ -954,7 +1044,7 @@ async def slash_testoff(inter: discord.Interaction):
     STATE["test_override_modifier"] = None
     save_state(force=True)
     await inter.response.send_message(
-        "✅ Test disattivato. Da ora /apertura usa il modificatore **casuale settimanale**.",
+        "✅ Test disattivato. Da ora la prossima apertura **classica** usa il modificatore **casuale settimanale**.",
         ephemeral=True
     )
 
@@ -977,25 +1067,93 @@ async def slash_mostraedizione(inter: discord.Interaction):
 async def slash_stato(inter: discord.Interaction):
     open_msg = STATE.get("open_message_id")
     current_week = week_key(now_tz())
+    mode = STATE.get("lottery_mode", "classic")
+    auto_enabled = STATE.get("automation_enabled", True)
+    current_active_modifier = STATE.get("active_modifier")
+    future_modifier = get_future_effective_modifier()
 
     desc = [
         f"🧾 **Prossima edizione:** {STATE.get('edition', 1)}",
         f"📬 **Lotteria aperta:** {'Sì' if open_msg else 'No'}",
         f"🗓️ **Settimana corrente:** {current_week}",
-        f"⚙️ **Weekly modifier:** {modifier_label(STATE.get('weekly_modifier'))}",
-        f"🧪 **Override test:** {modifier_label(STATE.get('test_override_modifier')) if STATE.get('test_override_modifier') else 'Nessuno'}",
-        f"🎯 **Modifier apertura corrente:** {modifier_label(STATE.get('active_modifier'))}",
+        f"🎭 **Modalità attiva:** {mode_label(mode)}",
+        f"🤖 **Automazione:** {automation_label()}",
+    ]
+
+    if mode == "special":
+        desc += [
+            "⚙️ **Modificatori:** OFF",
+            "🧪 **Override test:** ignorato in modalità SPECIALE",
+            "🎯 **Modifier apertura corrente:** OFF",
+            "🔮 **Prossima apertura automatica:** SPECIALE",
+        ]
+    else:
+        desc += [
+            f"⚙️ **Weekly modifier:** {modifier_label(STATE.get('weekly_modifier'))}",
+            f"🧪 **Override test:** {modifier_label(STATE.get('test_override_modifier')) if STATE.get('test_override_modifier') else 'Nessuno'}",
+            f"🎯 **Modifier apertura corrente:** {modifier_label(current_active_modifier)}",
+            f"🔮 **Prossimo modificatore effettivo:** {modifier_label(future_modifier)}",
+            "🔮 **Prossima apertura automatica:** CLASSICA" if auto_enabled else "🔮 **Prossima apertura automatica:** disattivata",
+        ]
+
+    desc += [
         f"📤 **Ultima apertura auto:** {STATE.get('last_open_week') or 'mai'}",
         f"🔒 **Ultima chiusura auto:** {STATE.get('last_close_week') or 'mai'}",
         f"📣 **Ultimo annuncio auto:** {STATE.get('last_announce_week') or 'mai'}",
         f"👥 **Utenti registrati:** {len(STATE.get('wins', {}))}",
+        "",
     ]
-    desc += [""] + auto_schedule_status_lines()
+    desc += auto_schedule_status_lines()
 
     await inter.response.send_message(
         embed=imperial_embed("STATO LOTTERIA IMPERIVM", "\n".join(desc), color=GOLD),
         ephemeral=True
     )
+
+@bot.tree.command(name="automazione", description="Attiva o disattiva l'automazione settimanale (solo admin).")
+@admin_only_command()
+@app_commands.describe(stato="on oppure off")
+@app_commands.choices(stato=[
+    app_commands.Choice(name="ON", value="on"),
+    app_commands.Choice(name="OFF", value="off"),
+])
+async def slash_automazione(inter: discord.Interaction, stato: app_commands.Choice[str]):
+    new_state = (stato.value == "on")
+    STATE["automation_enabled"] = new_state
+    save_state(force=True)
+    await inter.response.send_message(
+        f"🤖 Automazione impostata su **{automation_label()}**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="modalita", description="Imposta la modalità settimanale automatica: classica o speciale (solo admin).")
+@admin_only_command()
+@app_commands.describe(tipo="classica oppure speciale")
+@app_commands.choices(tipo=[
+    app_commands.Choice(name="CLASSICA", value="classic"),
+    app_commands.Choice(name="SPECIALE", value="special"),
+])
+async def slash_modalita(inter: discord.Interaction, tipo: app_commands.Choice[str]):
+    if STATE.get("open_message_id"):
+        await inter.response.send_message(
+            "❌ Non puoi cambiare modalità mentre una lotteria è già aperta.",
+            ephemeral=True
+        )
+        return
+
+    STATE["lottery_mode"] = tipo.value
+    save_state(force=True)
+
+    if tipo.value == "special":
+        msg = (
+            "🎭 Modalità automatica impostata su **SPECIALE**.\n"
+            "⚙️ Modificatori: **OFF**\n"
+            "Dopo l'annuncio speciale automatico, la modalità tornerà da sola a **CLASSICA**."
+        )
+    else:
+        msg = "🎭 Modalità automatica impostata su **CLASSICA**."
+
+    await inter.response.send_message(msg, ephemeral=True)
 
 # ---------- Comandi livelli ----------
 
@@ -1253,7 +1411,7 @@ async def slash_annunciospeciale(inter: discord.Interaction):
 
 @bot.tree.command(name="testautoapertura", description="Testa l'apertura automatica tra X minuti (solo admin).")
 @admin_only_command()
-@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'apertura classica")
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'apertura automatica secondo la modalità attiva")
 async def slash_testautoapertura(inter: discord.Interaction, minuti: int):
     if not require_guild(inter):
         await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
@@ -1263,17 +1421,22 @@ async def slash_testautoapertura(inter: discord.Interaction, minuti: int):
         return
 
     async def _runner():
-        await open_lottery(inter.guild, special=False)
+        special = (STATE.get("lottery_mode", "classic") == "special")
+        ed = int(STATE.get("edition", 1))
+        await open_lottery(inter.guild, special=special)
+        STATE["edition"] = ed + 1
+        save_state(force=True)
 
     schedule_test_task("open", minuti, _runner)
     await inter.response.send_message(
-        f"⏰ Test apertura automatica programmato tra **{minuti} minuti**.",
+        f"⏰ Test apertura automatica programmato tra **{minuti} minuti** "
+        f"(modalità {mode_label(STATE.get('lottery_mode', 'classic'))}).",
         ephemeral=True
     )
 
 @bot.tree.command(name="testautochiusura", description="Testa la chiusura automatica tra X minuti (solo admin).")
 @admin_only_command()
-@app_commands.describe(minuti="Numero di minuti dopo cui eseguire la chiusura classica")
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire la chiusura automatica secondo la modalità attiva")
 async def slash_testautochiusura(inter: discord.Interaction, minuti: int):
     if not require_guild(inter):
         await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
@@ -1283,17 +1446,19 @@ async def slash_testautochiusura(inter: discord.Interaction, minuti: int):
         return
 
     async def _runner():
-        await close_and_pick(inter.guild, announce_now=False, special=False)
+        special = (STATE.get("lottery_mode", "classic") == "special")
+        await close_and_pick(inter.guild, announce_now=False, special=special)
 
     schedule_test_task("close", minuti, _runner)
     await inter.response.send_message(
-        f"⏰ Test chiusura automatica programmato tra **{minuti} minuti**.",
+        f"⏰ Test chiusura automatica programmato tra **{minuti} minuti** "
+        f"(modalità {mode_label(STATE.get('lottery_mode', 'classic'))}).",
         ephemeral=True
     )
 
 @bot.tree.command(name="testautoannuncio", description="Testa l'annuncio automatico tra X minuti (solo admin).")
 @admin_only_command()
-@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'annuncio classico")
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'annuncio automatico secondo la modalità attiva")
 async def slash_testautoannuncio(inter: discord.Interaction, minuti: int):
     if not require_guild(inter):
         await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
@@ -1306,11 +1471,19 @@ async def slash_testautoannuncio(inter: discord.Interaction, minuti: int):
         ch = await get_lottery_channel(inter.guild)
         if not ch:
             return
-        await post_winner_announcement_classic(ch, inter.guild)
+
+        special = (STATE.get("lottery_mode", "classic") == "special")
+        if special:
+            lw = STATE.get("last_winner_id")
+            winner_id = int(lw) if lw else None
+            await post_winner_announcement_special(ch, inter.guild, winner_id)
+        else:
+            await post_winner_announcement_classic(ch, inter.guild)
 
     schedule_test_task("announce", minuti, _runner)
     await inter.response.send_message(
-        f"⏰ Test annuncio automatico programmato tra **{minuti} minuti**.",
+        f"⏰ Test annuncio automatico programmato tra **{minuti} minuti** "
+        f"(modalità {mode_label(STATE.get('lottery_mode', 'classic'))}).",
         ephemeral=True
     )
 
@@ -1334,6 +1507,7 @@ async def setup_hook():
 
         if SYNC_GUILD_ID:
             guild_obj = discord.Object(id=SYNC_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild_obj)
             synced = await bot.tree.sync(guild=guild_obj)
             print(f"✅ Slash sync su guild {SYNC_GUILD_ID}: {len(synced)} comandi.")
         else:
