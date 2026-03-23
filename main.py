@@ -1,65 +1,41 @@
-# === IMPERIVM Lottery Bot — main.py (Render / discord.py 2.x) ===
-# Stato persistito su GitHub Gist (nessun automatismo settimanale)
-# Edizione speciale SOLO quando usi /aperturaspeciale
-#
-# FIX STABILITÀ:
-# - Evitato sync globale automatico a ogni boot (causa probabile dei 429 / Cloudflare 1015)
-# - Sync slash opzionale via env: SYNC_ON_START=true/false
-# - Possibilità di sync su singola guild via env: SYNC_GUILD_ID
-# - Debounce salvataggi Gist per evitare spam di PATCH
-# - Migliorati alcuni controlli su guild/channel/message
+# === IMPERIVM Lottery Bot — main.py (VPS / discord.py 2.x) ===
+# Stato persistito su GitHub Gist
+# Lotteria classica + speciale
+# Automazione VPS:
+# - Mercoledì 00:00 apertura classica
+# - Giovedì 00:00 chiusura classica
+# - Giovedì 08:00 annuncio classico
+# Comandi test automazione inclusi
 
 import os
 import json
 import random
 import time
+import asyncio
 from datetime import datetime
-from threading import Thread
 from typing import Optional, List, Dict, Tuple
+
 import urllib.request
 import urllib.error
 
 import pytz
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
-
-# --- Mini web server per Render (healthcheck) ---
-from flask import Flask
-try:
-    from waitress import serve
-    USE_WAITRESS = True
-except Exception:
-    USE_WAITRESS = False
-
-app = Flask(__name__)
-
-@app.get("/")
-def index():
-    return "IMPERIVM Lottery Bot è vivo 📜"
-
-def start_web_server():
-    port = int(os.getenv("PORT", "8080"))
-    if USE_WAITRESS:
-        Thread(target=lambda: serve(app, host="0.0.0.0", port=port), daemon=True).start()
-    else:
-        Thread(target=lambda: app.run(host="0.0.0.0", port=port), daemon=True).start()
 
 # ---------- Config ----------
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True
 INTENTS.guilds = True
 INTENTS.members = True
 INTENTS.reactions = True
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
-    raise RuntimeError("❌ Manca DISCORD_TOKEN nelle Environment Variables di Render.")
+    raise RuntimeError("❌ Manca DISCORD_TOKEN nelle variabili ambiente.")
 
 LOTTERY_CHANNEL_ID = int(os.getenv("LOTTERY_CHANNEL_ID", "0"))
 
-# Admin extra (facoltativo). Se vuoto valgono i permessi admin Discord.
 ADMIN_IDS = set()
 _env_admins = os.getenv("ADMINS", "").strip()
 if _env_admins:
@@ -70,27 +46,26 @@ if _env_admins:
 
 TZ = pytz.timezone(os.getenv("TZ", "Europe/Rome"))
 
-# Sync slash:
-# IMPORTANTE: su Render conviene tenerlo FALSE per non fare sync a ogni riavvio
+# Sync slash opzionale
 SYNC_ON_START = os.getenv("SYNC_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}
 SYNC_GUILD_ID = int(os.getenv("SYNC_GUILD_ID", "0"))
 
 # Debounce salvataggi Gist
 GIST_SAVE_MIN_INTERVAL = float(os.getenv("GIST_SAVE_MIN_INTERVAL", "2.0"))
 
-# Colore default (admin/speciale)
+# Colori
 GOLD = discord.Color.from_str("#DAA520")
+COLOR_INT = discord.Color.from_str("#C0392B")
+COLOR_AGI = discord.Color.from_str("#27AE60")
+COLOR_CHA = discord.Color.from_str("#2980B9")
+COLOR_STR = discord.Color.from_str("#8E5A2B")
 
-# --- Colori elementi (cornice embed lotteria classica) ---
-COLOR_INT = discord.Color.from_str("#C0392B")  # rosso
-COLOR_AGI = discord.Color.from_str("#27AE60")  # verde
-COLOR_CHA = discord.Color.from_str("#2980B9")  # blu
-COLOR_STR = discord.Color.from_str("#8E5A2B")  # marrone
-
-# --- Gist persistence ---
+# Gist
 GIST_ID = os.getenv("GIST_ID") or ""
 GIST_FILENAME = os.getenv("GIST_FILENAME") or "imperivm_state.json"
 GIST_TOKEN = os.getenv("GIST_TOKEN") or ""
+
+# ---------- Gist / State ----------
 
 def _gist_api_url() -> str:
     return f"https://api.github.com/gists/{GIST_ID}"
@@ -103,74 +78,61 @@ def _gist_headers() -> Dict[str, str]:
 
 STATE: Dict = {}
 _LAST_GIST_SAVE_TS = 0.0
+TEST_TASKS: Dict[str, asyncio.Task] = {}
 
 DEFAULT_STATE = {
     "schema": "imperivm.lottery.v1",
     "edition": 1,
     "open_message_id": None,
 
-    # Livelli: salviamo il LIVELLO (1..3). Se mancante => default = 1.
     "wins": {},
-
-    # Statistiche (solo CLASSICA, non speciale)
     "victories": {},
     "cycles": {},
-
-    # Per sorte truccata (aggiornato anche da Strength e Speciale)
     "last_win_iso": {},
 
     "last_winner_id": None,
     "last_winner_ids": [],
+    "last_winner_prev_levels": {},
+    "last_winner_reset_flags": {},
 
-    # livello "prima della vittoria" usato per calcolare premio (per annuncio corretto)
-    "last_winner_prev_levels": {},   # {uid: prev_level}
-    # flag reset per Strength (solo informativo in annuncio)
-    "last_winner_reset_flags": {},   # {uid: bool}
+    "last_special_prize": None,
 
-    # premio speciale bloccato in chiusura
-    "last_special_prize": None,      # int (kama)
-
-    # Modificatori
     "weekly_modifier": None,
     "weekly_modifier_week": None,
-
-    # Override test
     "test_override_modifier": None,
-
-    # Modificatore effettivamente usato nell'ultima apertura classica
     "active_modifier": None,
 
-    # Cache nomi
     "names": {},
 
-    # compat
     "last_open_week": None,
     "last_close_week": None,
     "last_announce_week": None,
 }
 
-# ---------- Helpers Gist ----------
-
 def load_state_from_gist() -> Dict:
     if not GIST_ID:
         return DEFAULT_STATE.copy()
+
     try:
         req = urllib.request.Request(_gist_api_url(), headers=_gist_headers(), method="GET")
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+
         files = data.get("files", {})
         file_obj = files.get(GIST_FILENAME)
         if not file_obj:
             return DEFAULT_STATE.copy()
+
         content = file_obj.get("content", "")
         if not content:
             return DEFAULT_STATE.copy()
+
         parsed = json.loads(content)
+
         for k, v in DEFAULT_STATE.items():
             if k not in parsed:
                 parsed[k] = v
 
-        # normalizza tipi
         if not isinstance(parsed.get("last_winner_ids"), list):
             parsed["last_winner_ids"] = []
         if not isinstance(parsed.get("names"), dict):
@@ -189,6 +151,7 @@ def load_state_from_gist() -> Dict:
             parsed["last_winner_reset_flags"] = {}
 
         return parsed
+
     except Exception as e:
         print("Errore load Gist:", e)
         return DEFAULT_STATE.copy()
@@ -196,6 +159,7 @@ def load_state_from_gist() -> Dict:
 def save_state_to_gist(state: Dict):
     if not GIST_ID:
         return
+
     payload = json.dumps({
         "files": {
             GIST_FILENAME: {
@@ -203,6 +167,7 @@ def save_state_to_gist(state: Dict):
             }
         }
     }).encode("utf-8")
+
     try:
         req = urllib.request.Request(_gist_api_url(), headers=_gist_headers(), data=payload, method="PATCH")
         with urllib.request.urlopen(req, timeout=20) as _:
@@ -230,6 +195,7 @@ def save_state(force: bool = False):
     save_state_to_gist(STATE)
 
 # ---------- Bot ----------
+
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
 
 # ---------- Utility ----------
@@ -239,6 +205,13 @@ def _slash_admin_guard(inter: discord.Interaction) -> bool:
         return True
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and perms.administrator)
+
+def admin_only_command():
+    def deco(func):
+        func = app_commands.guild_only()(func)
+        func = app_commands.default_permissions(administrator=True)(func)
+        return func
+    return deco
 
 async def get_lottery_channel(guild: Optional[discord.Guild]) -> Optional[discord.TextChannel]:
     if guild is None:
@@ -252,8 +225,7 @@ async def get_lottery_channel(guild: Optional[discord.Guild]) -> Optional[discor
     return guild.text_channels[0] if guild.text_channels else None
 
 def imperial_embed(title: str, desc: str, color: discord.Color = GOLD) -> discord.Embed:
-    nice_title = "📜  " + title + "  📜"
-    e = discord.Embed(title=nice_title, description=desc, color=color)
+    e = discord.Embed(title=f"📜  {title}  📜", description=desc, color=color)
     e.set_footer(text="IMPERIVM • Lotteria settimanale")
     return e
 
@@ -268,15 +240,24 @@ def fmt_kama(n: int) -> str:
     return f"{n:,}".replace(",", ".") + " Kama"
 
 def remember_name(uid: int, display_name: str):
-    if not display_name:
-        return
-    STATE.setdefault("names", {})
-    STATE["names"][str(uid)] = display_name
+    if display_name:
+        STATE.setdefault("names", {})
+        STATE["names"][str(uid)] = display_name
 
 def name_fallback(uid: int) -> str:
     return STATE.get("names", {}).get(str(uid), f"utente {uid}")
 
-# ---------- Modificatori settimanali (SOLO CLASSICA) ----------
+def require_guild(inter: discord.Interaction) -> bool:
+    return inter.guild is not None
+
+def clear_user_state(uid: str):
+    STATE.get("wins", {}).pop(uid, None)
+    STATE.get("victories", {}).pop(uid, None)
+    STATE.get("cycles", {}).pop(uid, None)
+    STATE.get("last_win_iso", {}).pop(uid, None)
+    STATE.get("names", {}).pop(uid, None)
+
+# ---------- Modificatori ----------
 
 MOD_INT = "INT"
 MOD_CHA = "CHA"
@@ -420,7 +401,7 @@ def update_last_win_iso_only(uid: str):
     STATE.setdefault("last_win_iso", {})
     STATE["last_win_iso"][uid] = now_tz().isoformat(timespec="seconds")
 
-# ---------- Testi & messaggi ----------
+# ---------- Testi ----------
 
 def _classic_open_lines(edition: int, mod: str) -> List[str]:
     base = [
@@ -459,6 +440,8 @@ def _special_open_lines(edition: int) -> List[str]:
         "🕗 *Annuncio del vincitore alle **08:00** di giovedì.*",
     ]
 
+# ---------- Messaggi ----------
+
 async def post_open_message(channel: discord.TextChannel, special: bool):
     edition = STATE["edition"]
 
@@ -491,10 +474,7 @@ async def post_close_message(channel: discord.TextChannel, no_participants: bool
         await channel.send(embed=imperial_embed("LOTTERIA IMPERIVM – CHIUSA", desc, color=color))
         return
 
-    desc = (
-        "I sigilli sono stati chiusi.\n"
-        "I nomi sono stati consegnati al Fato.\n\n"
-    )
+    desc = "I sigilli sono stati chiusi.\nI nomi sono stati consegnati al Fato.\n\n"
     if names_preview:
         desc += names_preview + "\n\n"
 
@@ -542,7 +522,6 @@ async def post_winner_announcement_classic(channel: discord.TextChannel, guild: 
 
         prev_lvl = int(prev_levels.get(uid, 1))
         prev_lvl = max(1, min(3, prev_lvl))
-
         lvl_now = get_level(uid)
 
         if mod == MOD_CHA and len(ids) == 2:
@@ -659,7 +638,7 @@ async def collect_participants(msg: discord.Message) -> List[int]:
                     ids.append(u.id)
     return list(dict.fromkeys(ids))
 
-# ---------- Sorte truccata / Agility weights ----------
+# ---------- Weighted pick ----------
 
 def _time_weight_from_last_win(uid: str) -> float:
     iso = STATE.get("last_win_iso", {}).get(uid)
@@ -668,7 +647,7 @@ def _time_weight_from_last_win(uid: str) -> float:
     try:
         last = datetime.fromisoformat(iso)
         delta_days = max(0.0, (now_tz() - last).total_seconds() / 86400.0)
-        return 1.0 + min(delta_days / 7.0, 2.0)  # 1..3
+        return 1.0 + min(delta_days / 7.0, 2.0)
     except Exception:
         return 1.5
 
@@ -697,7 +676,7 @@ def weighted_pick(participants: List[int], mod: Optional[str]) -> int:
 
     return random.choices(participants, weights=weights, k=1)[0]
 
-# ---------- Close / Pick ----------
+# ---------- Core lottery ----------
 
 async def _close_and_pick_common(guild: discord.Guild, special: bool):
     channel = await get_lottery_channel(guild)
@@ -820,6 +799,119 @@ async def open_lottery(guild: Optional[discord.Guild], special: bool = False):
 
     await post_open_message(channel, special=special)
 
+# ---------- Automazione ----------
+
+def auto_schedule_status_lines() -> List[str]:
+    return [
+        "⏰ **Automazione attiva**",
+        "• Mercoledì 00:00 → apertura classica",
+        "• Giovedì 00:00 → chiusura classica",
+        "• Giovedì 08:00 → annuncio classico",
+    ]
+
+async def run_auto_open():
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return
+
+    wk = week_key(now_tz())
+    if STATE.get("last_open_week") == wk:
+        return
+
+    await open_lottery(guild, special=False)
+    STATE["last_open_week"] = wk
+    save_state(force=True)
+    print(f"[AUTO] Apertura automatica eseguita per settimana {wk}")
+
+async def run_auto_close():
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return
+
+    wk = week_key(now_tz())
+    if STATE.get("last_close_week") == wk:
+        return
+
+    await close_and_pick(guild, announce_now=False, special=False)
+    STATE["last_close_week"] = wk
+    save_state(force=True)
+    print(f"[AUTO] Chiusura automatica eseguita per settimana {wk}")
+
+async def run_auto_announce():
+    guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return
+
+    wk = week_key(now_tz())
+    if STATE.get("last_announce_week") == wk:
+        return
+
+    ch = await get_lottery_channel(guild)
+    if not ch:
+        return
+
+    await post_winner_announcement_classic(ch, guild)
+
+    STATE["last_announce_week"] = wk
+    STATE["last_winner_id"] = None
+    STATE["last_winner_ids"] = []
+    STATE["last_winner_prev_levels"] = {}
+    STATE["last_winner_reset_flags"] = {}
+    save_state(force=True)
+    print(f"[AUTO] Annuncio automatico eseguito per settimana {wk}")
+
+@tasks.loop(minutes=1)
+async def automation_loop():
+    now = now_tz()
+    wd = now.weekday()  # lun=0 ... dom=6
+    hh = now.hour
+    mm = now.minute
+
+    try:
+        # Mercoledì 00:00
+        if wd == 2 and hh == 0 and mm == 0:
+            await run_auto_open()
+
+        # Giovedì 00:00
+        if wd == 3 and hh == 0 and mm == 0:
+            await run_auto_close()
+
+        # Giovedì 08:00
+        if wd == 3 and hh == 8 and mm == 0:
+            await run_auto_announce()
+
+    except Exception as e:
+        print("[AUTO] Errore automation_loop:", e)
+
+@automation_loop.before_loop
+async def before_automation_loop():
+    await bot.wait_until_ready()
+
+def schedule_test_task(name: str, minutes: int, coro_func):
+    async def runner():
+        try:
+            await asyncio.sleep(minutes * 60)
+            await coro_func()
+        except asyncio.CancelledError:
+            print(f"[TEST-AUTO] Task {name} annullato.")
+        except Exception as e:
+            print(f"[TEST-AUTO] Errore task {name}:", e)
+
+    old = TEST_TASKS.get(name)
+    if old and not old.done():
+        old.cancel()
+
+    TEST_TASKS[name] = asyncio.create_task(runner())
+
+def cancel_all_test_tasks() -> int:
+    count = 0
+    for task in TEST_TASKS.values():
+        if task and not task.done():
+            task.cancel()
+            count += 1
+    TEST_TASKS.clear()
+    return count
+
 # ---------- Eventi ----------
 
 @bot.event
@@ -828,18 +920,16 @@ async def on_ready():
         await bot.change_presence(activity=discord.Game("Lotteria IMPERIVM"))
     except Exception:
         pass
+
+    if not automation_loop.is_running():
+        automation_loop.start()
+
     print(f"✅ Bot online come {bot.user} — prossima edizione: {STATE.get('edition')}")
+    print(f"✅ Gist attivo: {'sì' if bool(GIST_ID) else 'no'}")
+    print(f"✅ Canale lotteria ID: {LOTTERY_CHANNEL_ID or 'auto-primo-canale'}")
+    print(f"✅ Admin extra caricati: {len(ADMIN_IDS)}")
 
-# ---------- Slash commands (tutti admin-only e invisibili ai non-admin) ----------
-
-def admin_only_command():
-    def deco(func):
-        func = app_commands.guild_only()(func)
-        func = app_commands.default_permissions(administrator=True)(func)
-        return func
-    return deco
-
-# --- TEST MODIFICATORI ---
+# ---------- Comandi test modificatori ----------
 
 @bot.tree.command(name="testmodificatore", description="TEST: forza il modificatore classico per le prossime aperture (solo admin).")
 @admin_only_command()
@@ -863,9 +953,12 @@ async def slash_testmodificatore(inter: discord.Interaction, elemento: app_comma
 async def slash_testoff(inter: discord.Interaction):
     STATE["test_override_modifier"] = None
     save_state(force=True)
-    await inter.response.send_message("✅ Test disattivato. Da ora /apertura usa il modificatore **casuale settimanale**.", ephemeral=True)
+    await inter.response.send_message(
+        "✅ Test disattivato. Da ora /apertura usa il modificatore **casuale settimanale**.",
+        ephemeral=True
+    )
 
-# --- Utility ---
+# ---------- Comandi utilità ----------
 
 @bot.tree.command(name="whoami", description="Mostra il tuo ID e se sei admin.")
 @admin_only_command()
@@ -879,12 +972,37 @@ async def slash_mostraedizione(inter: discord.Interaction):
     ed = STATE.get("edition", 1)
     await inter.response.send_message(f"🧾 **Prossima edizione da aprire:** n°{ed}", ephemeral=True)
 
-# --- Livelli (admin-only) ---
+@bot.tree.command(name="stato", description="Mostra lo stato attuale della lotteria e dell'automazione (solo admin).")
+@admin_only_command()
+async def slash_stato(inter: discord.Interaction):
+    open_msg = STATE.get("open_message_id")
+    current_week = week_key(now_tz())
+
+    desc = [
+        f"🧾 **Prossima edizione:** {STATE.get('edition', 1)}",
+        f"📬 **Lotteria aperta:** {'Sì' if open_msg else 'No'}",
+        f"🗓️ **Settimana corrente:** {current_week}",
+        f"⚙️ **Weekly modifier:** {modifier_label(STATE.get('weekly_modifier'))}",
+        f"🧪 **Override test:** {modifier_label(STATE.get('test_override_modifier')) if STATE.get('test_override_modifier') else 'Nessuno'}",
+        f"🎯 **Modifier apertura corrente:** {modifier_label(STATE.get('active_modifier'))}",
+        f"📤 **Ultima apertura auto:** {STATE.get('last_open_week') or 'mai'}",
+        f"🔒 **Ultima chiusura auto:** {STATE.get('last_close_week') or 'mai'}",
+        f"📣 **Ultimo annuncio auto:** {STATE.get('last_announce_week') or 'mai'}",
+        f"👥 **Utenti registrati:** {len(STATE.get('wins', {}))}",
+    ]
+    desc += [""] + auto_schedule_status_lines()
+
+    await inter.response.send_message(
+        embed=imperial_embed("STATO LOTTERIA IMPERIVM", "\n".join(desc), color=GOLD),
+        ephemeral=True
+    )
+
+# ---------- Comandi livelli ----------
 
 @bot.tree.command(name="mostralivelli", description="Mostra i livelli registrati (solo admin).")
 @admin_only_command()
 async def slash_mostralivelli(inter: discord.Interaction):
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -909,8 +1027,8 @@ async def slash_mostralivelli(inter: discord.Interaction):
             name = name_fallback(uid_int)
         lines.append(f"• **{name}** — Livello: **{lvl_int}**")
 
-    PAGE_SIZE = 20
-    pages = [lines[i:i+PAGE_SIZE] for i in range(0, len(lines), PAGE_SIZE)]
+    page_size = 20
+    pages = [lines[i:i + page_size] for i in range(0, len(lines), page_size)]
     for idx, page in enumerate(pages, start=1):
         embed = imperial_embed(
             f"REGISTRO LIVELLI (corrente) — Pag. {idx}/{len(pages)}",
@@ -924,7 +1042,7 @@ async def slash_mostralivelli(inter: discord.Interaction):
 async def slash_pubblicalivelli(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -941,8 +1059,8 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
     items = sorted(wins.items(), key=lambda x: (-int(x[1]), int(x[0])))
 
     lines = []
-    MAX_PUBLIC = 30
-    for uid, lvl in items[:MAX_PUBLIC]:
+    max_public = 30
+    for uid, lvl in items[:max_public]:
         uid_int = int(uid)
         lvl_int = max(1, min(3, int(lvl)))
         member = inter.guild.get_member(uid_int)
@@ -953,17 +1071,16 @@ async def slash_pubblicalivelli(inter: discord.Interaction):
             name = name_fallback(uid_int)
         lines.append(f"• **{name}** — Livello **{lvl_int}**")
 
-    more = max(0, len(items) - MAX_PUBLIC)
+    more = max(0, len(items) - max_public)
     desc = "📜 **Classifica Livelli (Top):**\n" + "\n".join(lines)
     if more > 0:
         desc += f"\n\n…e altri **{more}**."
 
-    embed = imperial_embed("ALBO IMPERIALE — LIVELLI", desc, color=GOLD)
-    await ch.send(embed=embed)
+    await ch.send(embed=imperial_embed("ALBO IMPERIALE — LIVELLI", desc, color=GOLD))
     save_state()
     await inter.followup.send("✅ Classifica pubblicata nel canale lotteria.", ephemeral=True)
 
-# --- Admin gestione stato ---
+# ---------- Comandi gestione stato ----------
 
 @bot.tree.command(name="setedition", description="Imposta manualmente il numero di edizione (solo admin).")
 @admin_only_command()
@@ -983,10 +1100,12 @@ async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, l
     if livello < 1 or livello > 3:
         await inter.response.send_message("❌ Il livello deve essere tra 1 e 3.", ephemeral=True)
         return
+
     uid = str(utente.id)
     remember_name(utente.id, utente.display_name)
     set_level(uid, livello)
     save_state(force=True)
+
     tot = int(STATE.get("victories", {}).get(uid, 0))
     cyc = int(STATE.get("cycles", {}).get(uid, 0))
     await inter.response.send_message(
@@ -999,43 +1118,32 @@ async def slash_setlivello(inter: discord.Interaction, utente: discord.Member, l
 @admin_only_command()
 @app_commands.describe(utente="Utente da cancellare dalla memoria vincitori")
 async def slash_rimuoviwinner(inter: discord.Interaction, utente: discord.Member):
-    uid = str(utente.id)
-    STATE.get("wins", {}).pop(uid, None)
-    STATE.get("victories", {}).pop(uid, None)
-    STATE.get("cycles", {}).pop(uid, None)
-    STATE.get("last_win_iso", {}).pop(uid, None)
-    STATE.get("names", {}).pop(uid, None)
+    clear_user_state(str(utente.id))
     save_state(force=True)
     await inter.response.send_message(
         f"🧹 **{utente.display_name}** rimosso dalla memoria dei vincitori.",
         ephemeral=True
     )
 
-# alias richiesto
 @bot.tree.command(name="removewinner", description="Alias di /rimuoviwinner (solo admin).")
 @admin_only_command()
 @app_commands.describe(utente="Utente da cancellare dalla memoria vincitori")
 async def slash_removewinner(inter: discord.Interaction, utente: discord.Member):
-    uid = str(utente.id)
-    STATE.get("wins", {}).pop(uid, None)
-    STATE.get("victories", {}).pop(uid, None)
-    STATE.get("cycles", {}).pop(uid, None)
-    STATE.get("last_win_iso", {}).pop(uid, None)
-    STATE.get("names", {}).pop(uid, None)
+    clear_user_state(str(utente.id))
     save_state(force=True)
     await inter.response.send_message(
         f"🧹 **{utente.display_name}** rimosso dalla memoria dei vincitori.",
         ephemeral=True
     )
 
-# --- Lotteria CLASSICA ---
+# ---------- Comandi lotteria classica ----------
 
 @bot.tree.command(name="apertura", description="Apre la lotteria CLASSICA (solo admin).")
 @admin_only_command()
 async def slash_apertura(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1051,7 +1159,7 @@ async def slash_apertura(inter: discord.Interaction):
 async def slash_chiusura(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1065,7 +1173,7 @@ async def slash_chiusura(inter: discord.Interaction):
 async def slash_annuncio(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1084,14 +1192,14 @@ async def slash_annuncio(inter: discord.Interaction):
     save_state(force=True)
     await inter.followup.send("📣 Annuncio **classico** eseguito.", ephemeral=True)
 
-# --- SPECIALE ---
+# ---------- Comandi lotteria speciale ----------
 
-@bot.tree.command(name="aperturaspeciale", description="Apre la lotteria **Special Edition** (solo admin).")
+@bot.tree.command(name="aperturaspeciale", description="Apre la lotteria SPECIALE (solo admin).")
 @admin_only_command()
 async def slash_aperturaspeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1107,7 +1215,7 @@ async def slash_aperturaspeciale(inter: discord.Interaction):
 async def slash_chiusuraspeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1121,7 +1229,7 @@ async def slash_chiusuraspeciale(inter: discord.Interaction):
 async def slash_annunciospeciale(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True, thinking=True)
 
-    if not inter.guild:
+    if not require_guild(inter):
         await inter.followup.send("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
         return
 
@@ -1140,6 +1248,80 @@ async def slash_annunciospeciale(inter: discord.Interaction):
     STATE["last_special_prize"] = None
     save_state(force=True)
     await inter.followup.send("📣 Annuncio **SPECIALE** eseguito.", ephemeral=True)
+
+# ---------- Comandi test automazione ----------
+
+@bot.tree.command(name="testautoapertura", description="Testa l'apertura automatica tra X minuti (solo admin).")
+@admin_only_command()
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'apertura classica")
+async def slash_testautoapertura(inter: discord.Interaction, minuti: int):
+    if not require_guild(inter):
+        await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+    if minuti < 1:
+        await inter.response.send_message("❌ I minuti devono essere almeno 1.", ephemeral=True)
+        return
+
+    async def _runner():
+        await open_lottery(inter.guild, special=False)
+
+    schedule_test_task("open", minuti, _runner)
+    await inter.response.send_message(
+        f"⏰ Test apertura automatica programmato tra **{minuti} minuti**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="testautochiusura", description="Testa la chiusura automatica tra X minuti (solo admin).")
+@admin_only_command()
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire la chiusura classica")
+async def slash_testautochiusura(inter: discord.Interaction, minuti: int):
+    if not require_guild(inter):
+        await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+    if minuti < 1:
+        await inter.response.send_message("❌ I minuti devono essere almeno 1.", ephemeral=True)
+        return
+
+    async def _runner():
+        await close_and_pick(inter.guild, announce_now=False, special=False)
+
+    schedule_test_task("close", minuti, _runner)
+    await inter.response.send_message(
+        f"⏰ Test chiusura automatica programmato tra **{minuti} minuti**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="testautoannuncio", description="Testa l'annuncio automatico tra X minuti (solo admin).")
+@admin_only_command()
+@app_commands.describe(minuti="Numero di minuti dopo cui eseguire l'annuncio classico")
+async def slash_testautoannuncio(inter: discord.Interaction, minuti: int):
+    if not require_guild(inter):
+        await inter.response.send_message("❌ Questo comando funziona solo dentro un server.", ephemeral=True)
+        return
+    if minuti < 1:
+        await inter.response.send_message("❌ I minuti devono essere almeno 1.", ephemeral=True)
+        return
+
+    async def _runner():
+        ch = await get_lottery_channel(inter.guild)
+        if not ch:
+            return
+        await post_winner_announcement_classic(ch, inter.guild)
+
+    schedule_test_task("announce", minuti, _runner)
+    await inter.response.send_message(
+        f"⏰ Test annuncio automatico programmato tra **{minuti} minuti**.",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="annullatestauto", description="Annulla tutti i test automatici programmati (solo admin).")
+@admin_only_command()
+async def slash_annullatestauto(inter: discord.Interaction):
+    count = cancel_all_test_tasks()
+    await inter.response.send_message(
+        f"🛑 Test automatici annullati: **{count}**.",
+        ephemeral=True
+    )
 
 # ---------- Avvio ----------
 
@@ -1162,5 +1344,4 @@ async def setup_hook():
 
 if __name__ == "__main__":
     load_state()
-    start_web_server()
     bot.run(TOKEN)
