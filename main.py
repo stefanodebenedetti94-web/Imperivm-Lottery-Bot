@@ -48,6 +48,7 @@ if _env_admins:
         ADMIN_IDS = set()
 
 TZ = pytz.timezone(os.getenv("TZ", "Europe/Rome"))
+AUTO_WINDOW_MINUTES = int(os.getenv("AUTO_WINDOW_MINUTES", "10"))
 
 # Sync slash opzionale (solo se vuoi forzare sync al boot)
 SYNC_ON_START = os.getenv("SYNC_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -285,6 +286,39 @@ def get_future_effective_modifier() -> Optional[str]:
 
     ensure_weekly_modifier()
     return STATE.get("weekly_modifier")
+
+def in_time_window(now: datetime, target_weekday: int, target_hour: int, window_minutes: int = AUTO_WINDOW_MINUTES) -> bool:
+    """
+    True se siamo nel giorno/ora target e il minuto è dentro la finestra utile.
+    Esempio: 00:00 -> 00:09 se AUTO_WINDOW_MINUTES=10
+    """
+    return (
+        now.weekday() == target_weekday
+        and now.hour == target_hour
+        and 0 <= now.minute < window_minutes
+    )
+
+async def catch_up_automation_now():
+    """
+    Recupera eventi automatici se il bot si avvia/riavvia dentro la finestra utile.
+    Non duplica grazie ai last_*_week.
+    """
+    if not STATE.get("automation_enabled", True):
+        return
+
+    now = now_tz()
+
+    # Mercoledì 00:00-00:09 -> apertura
+    if in_time_window(now, target_weekday=2, target_hour=0):
+        await run_auto_open()
+
+    # Giovedì 00:00-00:09 -> chiusura
+    if in_time_window(now, target_weekday=3, target_hour=0):
+        await run_auto_close()
+
+    # Giovedì 08:00-08:09 -> annuncio
+    if in_time_window(now, target_weekday=3, target_hour=8):
+        await run_auto_announce()
 
 # ---------- Modificatori ----------
 
@@ -952,21 +986,18 @@ async def automation_loop():
         return
 
     now = now_tz()
-    wd = now.weekday()  # lun=0 ... dom=6
-    hh = now.hour
-    mm = now.minute
 
     try:
-        # Mercoledì 00:00
-        if wd == 2 and hh == 0 and mm == 0:
+        # Mercoledì 00:00-00:09
+        if in_time_window(now, target_weekday=2, target_hour=0):
             await run_auto_open()
 
-        # Giovedì 00:00
-        if wd == 3 and hh == 0 and mm == 0:
+        # Giovedì 00:00-00:09
+        if in_time_window(now, target_weekday=3, target_hour=0):
             await run_auto_close()
 
-        # Giovedì 08:00
-        if wd == 3 and hh == 8 and mm == 0:
+        # Giovedì 08:00-08:09
+        if in_time_window(now, target_weekday=3, target_hour=8):
             await run_auto_announce()
 
     except Exception as e:
@@ -1018,6 +1049,12 @@ async def on_ready():
     print(f"✅ Canale lotteria ID: {LOTTERY_CHANNEL_ID or 'auto-primo-canale'}")
     print(f"✅ Admin extra caricati: {len(ADMIN_IDS)}")
     print(f"✅ Automazione: {automation_label()} — Modalità: {mode_label(STATE.get('lottery_mode', 'classic'))}")
+    print(f"✅ Finestra automazione: primi {AUTO_WINDOW_MINUTES} minuti utili dell'ora target")
+
+    try:
+        await catch_up_automation_now()
+    except Exception as e:
+        print("[AUTO] Errore catch-up on_ready:", e)
 
 # ---------- Comandi test modificatori ----------
 
@@ -1519,3 +1556,4 @@ async def setup_hook():
 if __name__ == "__main__":
     load_state()
     bot.run(TOKEN)
+    
